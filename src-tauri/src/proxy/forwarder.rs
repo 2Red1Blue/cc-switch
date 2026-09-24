@@ -1203,32 +1203,35 @@ impl RequestForwarder {
 
         if let (Some(observer), Err(error)) = (&observer, &result) {
             if let Some(started) = observer.started_event() {
-                // Once response headers were observed, only the body stream wrapper may
-                // write terminal completion. A local body limit or downstream cancellation
-                // leaves started/headers-only evidence instead of claiming a full stream.
-                if observer.observed_status_code().is_none() {
-                    let (status_code, outcome) = match error {
+                // A retryable pre-commit failure can drop the upstream body after headers
+                // but before EOF. Close that hop durably before the retry loop chooses another
+                // provider; a body wrapper that already finished is idempotent here.
+                let observed_status = observer.observed_status_code();
+                let (status_code, outcome) = if observed_status.is_some() {
+                    (observed_status, "response_abandoned_before_terminal")
+                } else {
+                    match error {
                         ProxyError::UpstreamError { status, .. } => {
                             (Some(*status), "upstream_http_error")
                         }
                         ProxyError::Timeout(_) => (None, "transport_timeout"),
                         ProxyError::ForwardFailed(_) => (None, "transport_or_stream_error"),
                         _ => (None, "proxy_processing_error"),
-                    };
-                    if observer
-                        .finish(
-                            &started,
-                            started.upstream_model.clone(),
-                            status_code,
-                            outcome,
-                        )
-                        .is_err()
-                    {
-                        log::error!(
-                            "[Claude] managed route terminal receipt could not be persisted; outcome remains unknown"
-                        );
-                        return Err(ProxyError::ManagedRouteReceiptPersistenceFailed);
                     }
+                };
+                if observer
+                    .finish(
+                        &started,
+                        started.upstream_model.clone(),
+                        status_code,
+                        outcome,
+                    )
+                    .is_err()
+                {
+                    log::error!(
+                        "[Claude] managed route terminal receipt could not be persisted; outcome remains unknown"
+                    );
+                    return Err(ProxyError::ManagedRouteReceiptPersistenceFailed);
                 }
             }
         }
@@ -2510,6 +2513,7 @@ impl RequestForwarder {
                     log::error!(
                         "[Claude] managed route response-headers receipt could not be persisted; terminal evidence may be incomplete"
                     );
+                    return Err(ProxyError::ManagedRouteReceiptPersistenceFailed);
                 }
                 response.track_managed_route_terminal(observer.clone(), outbound_model.clone())
             }
@@ -4777,6 +4781,238 @@ mod tests {
                 ErrorCategory::NonRetryable
             );
         }
+    }
+
+    #[tokio::test]
+    async fn response_headers_receipt_failure_does_not_fail_over() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_attempts = attempts.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let attempts = handler_attempts.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    (StatusCode::SERVICE_UNAVAILABLE, "upstream unavailable")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            directory.path(),
+        ));
+        let _call_lease = store
+            .register_call("attempt-header-receipt-failure")
+            .unwrap();
+        let temporary_event = directory
+            .path()
+            .join("managed-route-events/.00000000000000000002.tmp");
+        std::fs::write(&temporary_event, b"ambiguous partial event").unwrap();
+
+        let call = super::super::managed_route_events::ManagedRouteCall::new(
+            store.clone(),
+            "attempt-header-receipt-failure".into(),
+            "call-1".into(),
+            "claude-sonnet".into(),
+        );
+        let mut extensions = http::Extensions::new();
+        extensions.insert(call);
+        let mut forwarder = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+        forwarder.max_attempts = 2;
+        let providers = ["provider-1", "provider-2"]
+            .into_iter()
+            .map(|id| {
+                let mut provider = test_provider_with_type(None);
+                provider.id = id.to_string();
+                provider.name = id.to_string();
+                provider.settings_config = json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": format!("http://{address}"),
+                        "ANTHROPIC_AUTH_TOKEN": "test-token"
+                    }
+                });
+                provider
+            })
+            .collect();
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                json!({
+                    "model": "claude-sonnet",
+                    "max_tokens": 16,
+                    "messages": [{ "role": "user", "content": "hello" }]
+                }),
+                HeaderMap::new(),
+                extensions,
+                providers,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ForwardError {
+                error: ProxyError::ManagedRouteReceiptPersistenceFailed,
+                ..
+            })
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Acquire), 1);
+        let page = store
+            .read_page("attempt-header-receipt-failure", 0, None, 10)
+            .unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(
+            page.events[0].event_type,
+            super::super::managed_route_events::RouteEventType::HopStarted
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_after_response_headers_terminalizes_the_abandoned_hop() {
+        let first_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_route_attempts = first_attempts.clone();
+        let second_route_attempts = second_attempts.clone();
+        let app = axum::Router::new()
+            .route(
+                "/provider-1/v1/responses",
+                axum::routing::post(move || {
+                    let attempts = first_route_attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        let body = axum::body::Body::from(concat!(
+                            "event: response.failed\n",
+                            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}}\n\n"
+                        ));
+                        axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "text/event-stream")
+                            .body(body)
+                            .unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/provider-2/v1/responses",
+                axum::routing::post(move || {
+                    let attempts = second_route_attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        let body = axum::body::Body::from(concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"
+                        ));
+                        axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "text/event-stream")
+                            .body(body)
+                            .unwrap()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            directory.path(),
+        ));
+        let correlation_id = "attempt-header-timeout";
+        let call_lease = store.register_call(correlation_id).unwrap();
+        let call = super::super::managed_route_events::ManagedRouteCall::new(
+            store.clone(),
+            correlation_id.into(),
+            "call-1".into(),
+            "claude-sonnet".into(),
+        );
+        let mut extensions = http::Extensions::new();
+        extensions.insert(call);
+
+        let mut forwarder = test_forwarder(Duration::from_secs(1), Duration::from_millis(20));
+        forwarder.max_attempts = 2;
+        let providers = ["provider-1", "provider-2"]
+            .into_iter()
+            .map(|id| {
+                let mut provider = test_provider_with_type(None);
+                provider.id = id.to_string();
+                provider.name = id.to_string();
+                provider.meta = Some(crate::provider::ProviderMeta {
+                    api_format: Some("openai_responses".to_string()),
+                    ..Default::default()
+                });
+                provider.settings_config = json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": format!("http://{address}/{id}"),
+                        "ANTHROPIC_AUTH_TOKEN": "test-token"
+                    }
+                });
+                provider
+            })
+            .collect();
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                json!({
+                    "model": "claude-sonnet",
+                    "stream": true,
+                    "max_tokens": 16,
+                    "messages": [{ "role": "user", "content": "hello" }]
+                }),
+                HeaderMap::new(),
+                extensions,
+                providers,
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("second provider should succeed after closing the first hop")
+            });
+        let body = result.response.bytes_with_limit(1024).await.unwrap();
+        drop(call_lease);
+
+        assert_eq!(first_attempts.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(
+            second_attempts.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        let seal = store
+            .seal(correlation_id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(seal.sealed);
+        assert_eq!(seal.pending_hops, 0);
+        assert_eq!(seal.event_count, 6);
+        let page = store
+            .read_page(correlation_id, 0, seal.high_watermark, 10)
+            .unwrap();
+        assert_eq!(
+            page.events[2].outcome.as_deref(),
+            Some("response_abandoned_before_terminal")
+        );
+        assert_eq!(page.events[3].provider_id, "provider-2");
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("delta"));
+
+        server.abort();
     }
 
     #[test]

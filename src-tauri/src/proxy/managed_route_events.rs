@@ -5,14 +5,16 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::AtomicU64, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64},
+    Arc, Mutex,
+};
 
 pub const CORRELATION_HEADER: &str = "x-fabric-managed-attempt-id";
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_SCAN_SEQUENCES: u64 = 1_000;
 const MAX_EVENT_BYTES: u64 = 16 * 1024;
-// Quota uses fixed logical slots, including final records, possible atomic-write temps,
-// per-correlation seal state, and filesystem metadata. Allocations are never recycled.
+// Quota reserves final records, possible atomic-write temps, per-correlation state, and metadata.
 const LOGICAL_FILE_OVERHEAD_BYTES: u64 = 512;
 const LOGICAL_EVENT_SLOT_BYTES: u64 = MAX_EVENT_BYTES + LOGICAL_FILE_OVERHEAD_BYTES;
 const PER_HOP_RESERVATION_BYTES: u64 = 6 * LOGICAL_EVENT_SLOT_BYTES;
@@ -134,12 +136,18 @@ impl ManagedHopObserver {
     }
 
     pub fn record_headers(&self, status_code: u16) -> std::io::Result<()> {
-        *self
-            .status_code
-            .lock()
-            .map_err(|_| std::io::Error::other("route status lock poisoned"))? = Some(status_code);
         let Some(started) = self.started_event() else {
+            self.terminal_state
+                .store(3, std::sync::atomic::Ordering::Release);
             return Err(std::io::Error::other("route hop started event is missing"));
+        };
+        let mut observed_status = match self.status_code.lock() {
+            Ok(observed_status) => observed_status,
+            Err(_) => {
+                self.terminal_state
+                    .store(3, std::sync::atomic::Ordering::Release);
+                return Err(std::io::Error::other("route status lock poisoned"));
+            }
         };
         let mut event = RouteEvent::finished_from(
             &started,
@@ -148,7 +156,13 @@ impl ManagedHopObserver {
             "response_headers_received",
         );
         event.event_type = RouteEventType::HopHeaders;
-        self.call.store.append(event)
+        if let Err(error) = self.call.store.append(event) {
+            self.terminal_state
+                .store(3, std::sync::atomic::Ordering::Release);
+            return Err(error);
+        }
+        *observed_status = Some(status_code);
+        Ok(())
     }
 
     pub fn observed_status_code(&self) -> Option<u16> {
@@ -208,6 +222,9 @@ pub struct RouteEventStore {
     settings_dir: PathBuf,
     writer: Mutex<()>,
     activities: Mutex<HashMap<String, Arc<CallActivity>>>,
+    reconciled: AtomicBool,
+    observed_sequence: AtomicU64,
+    observed_allocated_bytes: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -330,6 +347,21 @@ struct DurableAllocatorState {
     allocated_bytes: u64,
 }
 
+#[derive(Default)]
+struct RebuiltCorrelationState {
+    event_count: u64,
+    pending_hops: u64,
+    completed_hops: u64,
+    last_sequence: Option<u64>,
+    hops: HashMap<String, RebuiltHopState>,
+}
+
+struct RebuiltHopState {
+    started: RouteEvent,
+    headers_seen: bool,
+    finished: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteSealResponse {
@@ -373,6 +405,9 @@ impl RouteEventStore {
             settings_dir: settings_dir.into(),
             writer: Mutex::new(()),
             activities: Mutex::new(HashMap::new()),
+            reconciled: AtomicBool::new(false),
+            observed_sequence: AtomicU64::new(0),
+            observed_allocated_bytes: AtomicU64::new(0),
         }
     }
 
@@ -422,6 +457,304 @@ impl RouteEventStore {
         write_allocator_state(&path, &state, &self.events_dir())
     }
 
+    fn ensure_reconciled_locked(&self) -> std::io::Result<()> {
+        let latest_sequence = self.latest_sequence_locked()?;
+        let allocated_bytes = self.allocator_bytes_locked()?;
+        if self.reconciled.load(std::sync::atomic::Ordering::Acquire)
+            && latest_sequence
+                == self
+                    .observed_sequence
+                    .load(std::sync::atomic::Ordering::Acquire)
+            && allocated_bytes
+                == self
+                    .observed_allocated_bytes
+                    .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.reconcile_durable_state_locked()?;
+        self.remember_current_locked()?;
+        self.reconciled
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn force_reconcile_locked(&self) -> std::io::Result<()> {
+        if let Err(error) = self.reconcile_durable_state_locked() {
+            self.reconciled
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(error);
+        }
+        self.remember_current_locked()?;
+        self.reconciled
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn allocator_bytes_locked(&self) -> std::io::Result<u64> {
+        let path = self.allocator_path();
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(read_allocator_state(&path, &self.events_dir())?.allocated_bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remember_current_locked(&self) -> std::io::Result<()> {
+        let latest_sequence = self.latest_sequence_locked()?;
+        let allocated_bytes = self.allocator_bytes_locked()?;
+        self.observed_sequence
+            .store(latest_sequence, std::sync::atomic::Ordering::Release);
+        self.observed_allocated_bytes
+            .store(allocated_bytes, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn reconcile_durable_state_locked(&self) -> std::io::Result<()> {
+        let latest_sequence = self.latest_sequence_locked()?;
+        let mut temporary_reservations = 0_u64;
+        for entry in fs::read_dir(self.events_dir())? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.ends_with(".tmp") {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if !metadata.file_type().is_file()
+                        || metadata.uid() != unsafe { libc::geteuid() }
+                        || metadata.mode() & 0o077 != 0
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "managed route temporary file is not private and owner-controlled",
+                        ));
+                    }
+                }
+                #[cfg(not(unix))]
+                if !metadata.file_type().is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "managed route temporary path is not a regular file",
+                    ));
+                }
+                temporary_reservations = temporary_reservations.saturating_add(1);
+                continue;
+            }
+            let Some(sequence) = name
+                .strip_suffix(".json")
+                .filter(|value| {
+                    value.len() == 20 && value.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if sequence > latest_sequence {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed route event exists beyond the contiguous sequence watermark",
+                ));
+            }
+        }
+        let mut correlations = HashMap::<String, RebuiltCorrelationState>::new();
+        for sequence in 1..=latest_sequence {
+            let event =
+                read_event_file(&self.event_path(sequence), sequence)?.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "managed route event sequence contains a gap",
+                    )
+                })?;
+            validate_event(&event)?;
+            let state = correlations
+                .entry(event.correlation_id.clone())
+                .or_default();
+            let expected_correlation_sequence = state.event_count.saturating_add(1);
+            if event.correlation_sequence != expected_correlation_sequence {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed route correlation sequence is inconsistent",
+                ));
+            }
+            match event.event_type {
+                RouteEventType::HopStarted => {
+                    if state.hops.contains_key(&event.hop_id) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "managed route hop has duplicate start events",
+                        ));
+                    }
+                    state.pending_hops = state.pending_hops.saturating_add(1);
+                    state.hops.insert(
+                        event.hop_id.clone(),
+                        RebuiltHopState {
+                            started: event.clone(),
+                            headers_seen: false,
+                            finished: false,
+                        },
+                    );
+                }
+                RouteEventType::HopHeaders => {
+                    let Some(hop) = state.hops.get_mut(&event.hop_id) else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "managed route headers event has no start event",
+                        ));
+                    };
+                    if hop.headers_seen || hop.finished || !same_hop_identity(&hop.started, &event)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "managed route headers event conflicts with its start event",
+                        ));
+                    }
+                    hop.headers_seen = true;
+                }
+                RouteEventType::HopFinished => {
+                    let Some(hop) = state.hops.get_mut(&event.hop_id) else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "managed route finish event has no start event",
+                        ));
+                    };
+                    if hop.finished
+                        || event.outcome.is_none()
+                        || !same_hop_identity(&hop.started, &event)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "managed route finish event conflicts with its start event",
+                        ));
+                    }
+                    hop.finished = true;
+                    state.pending_hops = state.pending_hops.saturating_sub(1);
+                    state.completed_hops = state.completed_hops.saturating_add(1);
+                }
+            }
+            state.event_count = expected_correlation_sequence;
+            state.last_sequence = Some(sequence);
+        }
+
+        let mut seal_states = HashMap::<String, DurableSealState>::new();
+        for entry in fs::read_dir(self.events_dir())? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(correlation_id) = name
+                .strip_prefix("corr-")
+                .and_then(|value| value.strip_suffix(".seal.json"))
+            else {
+                continue;
+            };
+            validate_correlation_id(correlation_id).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed route seal filename has an invalid correlation id",
+                )
+            })?;
+            let path = self.seal_path(correlation_id);
+            let state = read_seal_state(&path, correlation_id)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed route seal state disappeared during reconciliation",
+                )
+            })?;
+            if seal_states
+                .insert(correlation_id.to_string(), state)
+                .is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed route has duplicate correlation seal states",
+                ));
+            }
+        }
+
+        if correlations
+            .keys()
+            .any(|correlation_id| !seal_states.contains_key(correlation_id))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed route evidence has no correlation seal state",
+            ));
+        }
+
+        let mut allocated_bytes = 0_u64;
+        for (correlation_id, seal_state) in &mut seal_states {
+            let rebuilt = correlations.remove(correlation_id).unwrap_or_default();
+            if seal_state.high_watermark.is_some_and(|watermark| {
+                watermark > latest_sequence
+                    || rebuilt.last_sequence.is_some_and(|last| last > watermark)
+            }) || (seal_state.high_watermark.is_some() && rebuilt.pending_hops != 0)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed route evidence changed after its seal watermark",
+                ));
+            }
+            let counters_changed = seal_state.pending_hops != rebuilt.pending_hops
+                || seal_state.reserved_hops != rebuilt.pending_hops
+                || seal_state.event_count != rebuilt.event_count
+                || !seal_state.metadata_reserved;
+            seal_state.pending_hops = rebuilt.pending_hops;
+            seal_state.reserved_hops = rebuilt.pending_hops;
+            seal_state.event_count = rebuilt.event_count;
+            seal_state.metadata_reserved = true;
+            let correlation_bytes = PER_CORRELATION_RESERVATION_BYTES
+                .checked_add(
+                    rebuilt
+                        .completed_hops
+                        .checked_mul(3 * LOGICAL_EVENT_SLOT_BYTES)
+                        .ok_or_else(route_storage_full_error)?,
+                )
+                .and_then(|bytes| {
+                    rebuilt
+                        .pending_hops
+                        .checked_mul(PER_HOP_RESERVATION_BYTES)
+                        .and_then(|pending_bytes| bytes.checked_add(pending_bytes))
+                })
+                .ok_or_else(route_storage_full_error)?;
+            allocated_bytes = allocated_bytes
+                .checked_add(correlation_bytes)
+                .ok_or_else(route_storage_full_error)?;
+            if counters_changed {
+                write_seal_state(&self.seal_path(correlation_id), seal_state)?;
+            }
+        }
+        if allocated_bytes.saturating_add(SYSTEM_METADATA_RESERVE_BYTES) > MAX_ROUTE_STORAGE_BYTES {
+            return Err(route_storage_full_error());
+        }
+        let allocated_bytes = allocated_bytes
+            .checked_add(
+                temporary_reservations
+                    .checked_mul(LOGICAL_EVENT_SLOT_BYTES)
+                    .ok_or_else(route_storage_full_error)?,
+            )
+            .ok_or_else(route_storage_full_error)?;
+        if allocated_bytes.saturating_add(SYSTEM_METADATA_RESERVE_BYTES) > MAX_ROUTE_STORAGE_BYTES {
+            return Err(route_storage_full_error());
+        }
+        let allocator_path = self.allocator_path();
+        let mut allocator = match fs::symlink_metadata(&allocator_path) {
+            Ok(_) => read_allocator_state(&allocator_path, &self.events_dir())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DurableAllocatorState {
+                schema_version: 1,
+                allocated_bytes: 0,
+            },
+            Err(error) => return Err(error),
+        };
+        if allocator.allocated_bytes != allocated_bytes {
+            allocator.allocated_bytes = allocated_bytes;
+            write_allocator_state(&allocator_path, &allocator, &self.events_dir())?;
+        }
+        Ok(())
+    }
+
     fn seal_path(&self, correlation_id: &str) -> PathBuf {
         self.events_dir()
             .join(format!("corr-{correlation_id}.seal.json"))
@@ -461,6 +794,18 @@ impl RouteEventStore {
 
     /// Registers a correlation before body processing so sealing cannot miss ingress.
     pub fn register_call(&self, correlation_id: &str) -> std::io::Result<ManagedCallLease> {
+        let result = self.register_call_inner(correlation_id);
+        if result
+            .as_ref()
+            .is_err_and(|error| should_reconcile_after_error(error))
+        {
+            self.reconciled
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    fn register_call_inner(&self, correlation_id: &str) -> std::io::Result<ManagedCallLease> {
         validate_correlation_id(correlation_id).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid correlation id")
         })?;
@@ -476,6 +821,7 @@ impl RouteEventStore {
             .map_err(|_| std::io::Error::other("route event writer lock poisoned"))?;
         let _process_lock = acquire_file_lock(&self.lock_path())?;
         ensure_private_events_dir(&self.events_dir())?;
+        self.ensure_reconciled_locked()?;
         let path = self.seal_path(correlation_id);
         let mut durable = read_seal_state(&path, correlation_id)?;
         if durable.as_ref().is_some_and(|seal| seal.ingress_closed) {
@@ -512,6 +858,7 @@ impl RouteEventStore {
                 write_seal_state(&path, seal)?;
             }
         }
+        self.remember_current_locked()?;
         state.seal_checked = true;
         state.active_calls = state.active_calls.saturating_add(1);
         activity.active_watch.send_replace(state.active_calls);
@@ -542,6 +889,7 @@ impl RouteEventStore {
                 .map_err(|_| std::io::Error::other("route event writer lock poisoned"))?;
             let _process_lock = acquire_file_lock(&self.lock_path())?;
             ensure_private_events_dir(&self.events_dir())?;
+            self.force_reconcile_locked()?;
             let path = self.seal_path(correlation_id);
             let mut durable = read_seal_state(&path, correlation_id)?.ok_or_else(|| {
                 std::io::Error::new(
@@ -577,6 +925,7 @@ impl RouteEventStore {
             .lock()
             .map_err(|_| std::io::Error::other("route event writer lock poisoned"))?;
         let _process_lock = acquire_file_lock(&self.lock_path())?;
+        self.force_reconcile_locked()?;
         let path = self.seal_path(correlation_id);
         let mut durable = read_seal_state(&path, correlation_id)?.ok_or_else(|| {
             std::io::Error::new(
@@ -592,6 +941,7 @@ impl RouteEventStore {
         let high_watermark = self.latest_sequence_locked()?;
         durable.high_watermark = Some(durable.high_watermark.unwrap_or(high_watermark));
         write_seal_state(&path, &durable)?;
+        self.remember_current_locked()?;
         Ok(RouteSealResponse {
             schema_version: 1,
             producer_schema_generation: 1,
@@ -615,6 +965,8 @@ impl RouteEventStore {
         high_watermark: Option<u64>,
     ) -> std::io::Result<RouteSealResponse> {
         let _process_lock = acquire_file_lock(&self.lock_path())?;
+        ensure_private_events_dir(&self.events_dir())?;
+        self.force_reconcile_locked()?;
         let durable = read_seal_state(&self.seal_path(correlation_id), correlation_id)?;
         let pending_hops = durable.as_ref().map_or(0, |state| state.pending_hops);
         let event_count = durable.as_ref().map_or(0, |state| state.event_count);
@@ -650,7 +1002,19 @@ impl RouteEventStore {
     }
 
     /// Atomically allocates a global sequence and publishes an immutable event file.
-    pub fn append(&self, mut event: RouteEvent) -> std::io::Result<()> {
+    pub fn append(&self, event: RouteEvent) -> std::io::Result<()> {
+        let result = self.append_inner(event);
+        if result
+            .as_ref()
+            .is_err_and(|error| should_reconcile_after_error(error))
+        {
+            self.reconciled
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    fn append_inner(&self, mut event: RouteEvent) -> std::io::Result<()> {
         validate_event(&event)?;
         let _local = self
             .writer
@@ -659,6 +1023,7 @@ impl RouteEventStore {
         ensure_settings_dir(&self.settings_dir)?;
         let _process_lock = acquire_file_lock(&self.lock_path())?;
         ensure_private_events_dir(&self.events_dir())?;
+        self.ensure_reconciled_locked()?;
 
         let seal_path = self.seal_path(&event.correlation_id);
         let mut seal_state = match read_seal_state(&seal_path, &event.correlation_id)? {
@@ -679,6 +1044,12 @@ impl RouteEventStore {
                 initial
             }
         };
+        if seal_state.high_watermark.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed route correlation is sealed; late events are rejected",
+            ));
+        }
         let is_hop_started = event.event_type == RouteEventType::HopStarted;
         let is_hop_headers = event.event_type == RouteEventType::HopHeaders;
         let is_hop_finished = event.event_type == RouteEventType::HopFinished;
@@ -689,9 +1060,6 @@ impl RouteEventStore {
         }
         if is_hop_started {
             self.reserve_storage_locked(PER_HOP_RESERVATION_BYTES)?;
-            seal_state.pending_hops = seal_state.pending_hops.saturating_add(1);
-            seal_state.reserved_hops = seal_state.reserved_hops.saturating_add(1);
-            write_seal_state(&seal_path, &seal_state)?;
         } else if (is_hop_headers || is_hop_finished) && seal_state.reserved_hops == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -733,6 +1101,10 @@ impl RouteEventStore {
         sync_directory(&self.events_dir())?;
         write_sequence_atomically(&self.sequence_path(), sequence)?;
         seal_state.event_count = correlation_sequence;
+        if is_hop_started {
+            seal_state.pending_hops = seal_state.pending_hops.saturating_add(1);
+            seal_state.reserved_hops = seal_state.reserved_hops.saturating_add(1);
+        }
         if is_hop_finished {
             // Release only the three temporary-write slots. Three final event slots remain
             // charged permanently; missing optional headers therefore over-reserve safely.
@@ -741,6 +1113,7 @@ impl RouteEventStore {
             seal_state.reserved_hops = seal_state.reserved_hops.saturating_sub(1);
         }
         write_seal_state(&seal_path, &seal_state)?;
+        self.remember_current_locked()?;
         Ok(())
     }
 
@@ -866,6 +1239,21 @@ fn validate_event(event: &RouteEvent) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn same_hop_identity(started: &RouteEvent, later: &RouteEvent) -> bool {
+    started.correlation_id == later.correlation_id
+        && started.call_id == later.call_id
+        && started.hop_seq == later.hop_seq
+        && started.hop_id == later.hop_id
+        && started.provider_id == later.provider_id
+        && started.provider_revision == later.provider_revision
+        && started.provider_revision_status == later.provider_revision_status
+        && started.requested_model == later.requested_model
+        && match (&started.upstream_model, &later.upstream_model) {
+            (Some(started), Some(later)) => started == later,
+            _ => true,
+        }
 }
 
 fn read_event_file(path: &Path, expected_sequence: u64) -> std::io::Result<Option<RouteEvent>> {
@@ -995,6 +1383,14 @@ fn route_storage_full_error() -> std::io::Error {
     std::io::Error::other(RouteStorageFull)
 }
 
+fn should_reconcile_after_error(error: &std::io::Error) -> bool {
+    !is_storage_full_error(error)
+        && !matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
+        )
+}
+
 fn read_allocator_state(path: &Path, events_dir: &Path) -> std::io::Result<DurableAllocatorState> {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -1074,7 +1470,7 @@ fn write_allocator_state(
     }
     let bytes = serde_json::to_vec(state)
         .map_err(|error| std::io::Error::other(format!("serialize allocator state: {error}")))?;
-    let temporary = events_dir.join("allocator.json.tmp");
+    let temporary = events_dir.join(format!("allocator.{}.tmp", uuid::Uuid::new_v4()));
     write_private_file(&temporary, &bytes)?;
     fs::rename(&temporary, path)?;
     sync_directory(events_dir)
@@ -1113,7 +1509,11 @@ fn write_seal_state(path: &Path, state: &DurableSealState) -> std::io::Result<()
             "managed route seal state is oversized",
         ));
     }
-    let temporary = parent.join(format!("corr-{}.seal.json.tmp", state.correlation_id));
+    let temporary = parent.join(format!(
+        "corr-{}.{}.tmp",
+        state.correlation_id,
+        uuid::Uuid::new_v4()
+    ));
     write_private_file(&temporary, &bytes)?;
     fs::rename(&temporary, path)?;
     sync_directory(parent)
@@ -1151,7 +1551,10 @@ fn write_sequence_atomically(path: &Path, sequence: u64) -> std::io::Result<()> 
             "sequence path has no parent",
         )
     })?;
-    let temporary = parent.join("managed-route-events.sequence.tmp");
+    let temporary = parent.join(format!(
+        "managed-route-events.sequence.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
     write_private_file(&temporary, sequence.to_string().as_bytes())?;
     fs::rename(&temporary, path)?;
     sync_directory(parent)
@@ -1663,6 +2066,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_rebuilds_started_only_counters_from_immutable_events() {
+        let dir = tempdir().unwrap();
+        let store = RouteEventStore::new(dir.path());
+        store
+            .append(RouteEvent::started(
+                "attempt-reconcile-start",
+                "call-1",
+                1,
+                "hop-1",
+                "provider",
+                "model",
+            ))
+            .unwrap();
+        let mut state = read_seal_state(
+            &store.seal_path("attempt-reconcile-start"),
+            "attempt-reconcile-start",
+        )
+        .unwrap()
+        .unwrap();
+        state.event_count = 0;
+        state.pending_hops = 0;
+        state.reserved_hops = 0;
+        write_seal_state(&store.seal_path("attempt-reconcile-start"), &state).unwrap();
+        let mut allocator =
+            read_allocator_state(&store.allocator_path(), &store.events_dir()).unwrap();
+        allocator.allocated_bytes = PER_CORRELATION_RESERVATION_BYTES;
+        write_allocator_state(&store.allocator_path(), &allocator, &store.events_dir()).unwrap();
+
+        let restarted = RouteEventStore::new(dir.path());
+        let seal = restarted
+            .seal("attempt-reconcile-start", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!seal.sealed);
+        assert_eq!(seal.event_count, 1);
+        assert_eq!(seal.pending_hops, 1);
+        assert_eq!(seal.high_watermark, None);
+        let allocator =
+            read_allocator_state(&restarted.allocator_path(), &restarted.events_dir()).unwrap();
+        assert_eq!(
+            allocator.allocated_bytes,
+            PER_CORRELATION_RESERVATION_BYTES + PER_HOP_RESERVATION_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_refreshes_counters_changed_by_another_store() {
+        let dir = tempdir().unwrap();
+        let sealing_store = RouteEventStore::new(dir.path());
+        let lease = sealing_store.register_call("attempt-cross-store").unwrap();
+        drop(lease);
+
+        RouteEventStore::new(dir.path())
+            .append(RouteEvent::started(
+                "attempt-cross-store",
+                "call-1",
+                1,
+                "hop-1",
+                "provider",
+                "model",
+            ))
+            .unwrap();
+        let mut state = read_seal_state(
+            &sealing_store.seal_path("attempt-cross-store"),
+            "attempt-cross-store",
+        )
+        .unwrap()
+        .unwrap();
+        state.event_count = 0;
+        state.pending_hops = 0;
+        state.reserved_hops = 0;
+        write_seal_state(&sealing_store.seal_path("attempt-cross-store"), &state).unwrap();
+
+        let seal = sealing_store
+            .seal("attempt-cross-store", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!seal.sealed);
+        assert_eq!(seal.event_count, 1);
+        assert_eq!(seal.pending_hops, 1);
+        assert_eq!(seal.high_watermark, None);
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_published_finish_and_releases_unused_reservation() {
+        let dir = tempdir().unwrap();
+        let store = RouteEventStore::new(dir.path());
+        let started = RouteEvent::started(
+            "attempt-reconcile-finish",
+            "call-1",
+            1,
+            "hop-1",
+            "provider",
+            "model",
+        );
+        store.append(started.clone()).unwrap();
+        let mut headers = RouteEvent::finished_from(
+            &started,
+            started.upstream_model.clone(),
+            Some(200),
+            "response_headers_received",
+        );
+        headers.event_type = RouteEventType::HopHeaders;
+        store.append(headers).unwrap();
+        store
+            .append(RouteEvent::finished_from(
+                &started,
+                started.upstream_model.clone(),
+                Some(200),
+                "response_complete",
+            ))
+            .unwrap();
+
+        let mut state = read_seal_state(
+            &store.seal_path("attempt-reconcile-finish"),
+            "attempt-reconcile-finish",
+        )
+        .unwrap()
+        .unwrap();
+        state.event_count = 2;
+        state.pending_hops = 1;
+        state.reserved_hops = 1;
+        write_seal_state(&store.seal_path("attempt-reconcile-finish"), &state).unwrap();
+
+        let restarted = RouteEventStore::new(dir.path());
+        let seal = restarted
+            .seal(
+                "attempt-reconcile-finish",
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(seal.sealed);
+        assert_eq!(seal.event_count, 3);
+        assert_eq!(seal.pending_hops, 0);
+        assert_eq!(seal.high_watermark, Some(3));
+        let allocator =
+            read_allocator_state(&restarted.allocator_path(), &restarted.events_dir()).unwrap();
+        assert_eq!(
+            allocator.allocated_bytes,
+            PER_CORRELATION_RESERVATION_BYTES + 3 * LOGICAL_EVENT_SLOT_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn second_store_cannot_seal_before_a_late_admitted_call_starts_its_hop() {
+        let dir = tempdir().unwrap();
+        let original = RouteEventStore::new(dir.path());
+        let lease = original.register_call("attempt-handover").unwrap();
+        let replacement = RouteEventStore::new(dir.path());
+        let seal = replacement
+            .seal("attempt-handover", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(seal.sealed);
+        assert_eq!(seal.high_watermark, Some(0));
+
+        let call = ManagedRouteCall::new(
+            Arc::new(original),
+            "attempt-handover".into(),
+            "call-1".into(),
+            "model".into(),
+        );
+        let observer = ManagedHopObserver::new(call);
+        assert!(observer.start("provider", Some("model")).is_err());
+        assert!(observer.started_event().is_none());
+        drop(lease);
+    }
+
+    #[tokio::test]
     async fn route_events_page_stops_at_sealed_high_watermark() {
         let dir = tempdir().unwrap();
         let store = RouteEventStore::new(dir.path());
@@ -1800,6 +2373,10 @@ mod tests {
                     + 1;
             write_allocator_state(&store.allocator_path(), &allocator, &store.events_dir())
                 .unwrap();
+            store.observed_allocated_bytes.store(
+                allocator.allocated_bytes,
+                std::sync::atomic::Ordering::Release,
+            );
         }
         let call = ManagedRouteCall::new(
             store.clone(),
@@ -1840,6 +2417,13 @@ mod tests {
             &store.events_dir(),
         )
         .unwrap();
+        store
+            .reconciled
+            .store(true, std::sync::atomic::Ordering::Release);
+        store.observed_allocated_bytes.store(
+            MAX_ROUTE_STORAGE_BYTES - SYSTEM_METADATA_RESERVE_BYTES,
+            std::sync::atomic::Ordering::Release,
+        );
 
         for index in 0..(MAX_ROUTE_ACTIVITY_ENTRIES * 2) {
             let correlation_id = format!("attempt-{index}");
@@ -1878,6 +2462,10 @@ mod tests {
                 + (3 * LOGICAL_EVENT_SLOT_BYTES);
             write_allocator_state(&store.allocator_path(), &allocator, &store.events_dir())
                 .unwrap();
+            store.observed_allocated_bytes.store(
+                allocator.allocated_bytes,
+                std::sync::atomic::Ordering::Release,
+            );
         }
         let call = ManagedRouteCall::new(
             store.clone(),
@@ -1930,9 +2518,11 @@ mod tests {
         let observer = ManagedHopObserver::new(call);
         observer.start("provider", Some("model")).unwrap();
         let temp_path = store.events_dir().join(".00000000000000000002.tmp");
-        fs::write(&temp_path, b"partial temp data").unwrap();
+        write_private_file(&temp_path, b"partial temp data").unwrap();
 
         assert!(observer.record_headers(200).is_err());
+        assert!(observer.terminal_persistence_failed());
+        assert_eq!(observer.observed_status_code(), None);
         assert!(temp_path.exists());
         let page = store.read_page("attempt-temp", 0, None, 10).unwrap();
         assert_eq!(page.events.len(), 1);
