@@ -11,6 +11,12 @@ pub enum ProxyError {
     #[error("上游响应体超过大小上限: {0} 字节")]
     ResponseBodyTooLarge(usize),
 
+    #[error("托管路由回执持久化失败；上游结果为 UNKNOWN，不会自动重试")]
+    ManagedRouteReceiptPersistenceFailed,
+
+    #[error("托管路由回执存储达到 64 MiB 配额；上游请求已拒绝")]
+    ManagedRouteStorageFull,
+
     #[error("服务器已在运行")]
     AlreadyRunning,
 
@@ -161,6 +167,12 @@ impl IntoResponse for ProxyError {
                     }
                     ProxyError::ResponseBodyTooLarge(_) => {
                         (StatusCode::BAD_GATEWAY, self.to_string())
+                    }
+                    ProxyError::ManagedRouteReceiptPersistenceFailed => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+                    }
+                    ProxyError::ManagedRouteStorageFull => {
+                        (StatusCode::INSUFFICIENT_STORAGE, self.to_string())
                     }
                     ProxyError::UpstreamError { .. } => unreachable!(),
                 };

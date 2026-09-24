@@ -55,6 +55,9 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         // 数据库错误：500 Internal Server Error
         ProxyError::DatabaseError(_) => 500,
 
+        // Managed route receipt storage quota: 507 Insufficient Storage
+        ProxyError::ManagedRouteStorageFull => 507,
+
         // 转换错误：422 Unprocessable Entity
         ProxyError::TransformError(_) => 422,
 
@@ -109,6 +112,14 @@ mod tests {
     fn test_map_connection_error() {
         let error = ProxyError::ForwardFailed("Connection refused".to_string());
         assert_eq!(map_proxy_error_to_status(&error), 502);
+    }
+
+    #[test]
+    fn managed_route_storage_quota_maps_to_507() {
+        assert_eq!(
+            map_proxy_error_to_status(&ProxyError::ManagedRouteStorageFull),
+            507
+        );
     }
 
     #[test]

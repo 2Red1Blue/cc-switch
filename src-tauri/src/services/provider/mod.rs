@@ -2032,9 +2032,17 @@ requires_openai_auth = true
     async fn update_current_claude_desktop_provider_syncs_profile_when_proxy_takeover_is_active() {
         let home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
+        let _proxy_port_guard = crate::proxy::http_client::ProxyPortTestGuard::capture();
 
         let db = Arc::new(Database::memory().expect("init db"));
         let state = AppState::new(db.clone());
+
+        db.update_proxy_config(ProxyConfig {
+            listen_port: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("set an ephemeral proxy port for the test");
 
         let mut original = Provider::with_id(
             "p1".into(),
@@ -2083,7 +2091,7 @@ requires_openai_auth = true
                 .expect("update app proxy config");
         }
 
-        state
+        let proxy_info = state
             .proxy_service
             .start()
             .await
@@ -2131,7 +2139,10 @@ requires_openai_auth = true
         let profile: Value = read_json_file(&profile_path).expect("read desktop profile");
         assert_eq!(
             profile["inferenceGatewayBaseUrl"],
-            json!("http://127.0.0.1:15721/claude-desktop"),
+            json!(format!(
+                "http://127.0.0.1:{}/claude-desktop",
+                proxy_info.port
+            )),
             "desktop profile should stay pointed at the local gateway during takeover"
         );
         assert_eq!(profile["inferenceGatewayAuthScheme"], json!("bearer"));
@@ -2140,6 +2151,12 @@ requires_openai_auth = true
             json!([{ "name": "claude-sonnet-4-6", "labelOverride": "DeepSeek V4 Flash Updated", "supports1m": true }]),
             "provider edits should propagate into the Claude Desktop 3P profile during takeover"
         );
+
+        state
+            .proxy_service
+            .stop()
+            .await
+            .expect("stop the test proxy service");
     }
 
     #[test]

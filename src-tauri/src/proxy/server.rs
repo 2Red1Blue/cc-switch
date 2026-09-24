@@ -12,6 +12,7 @@ use super::{
     failover_switch::FailoverSwitchManager,
     handlers,
     log_codes::srv as log_srv,
+    managed_route_events::{control_socket_path, RouteEventStore},
     provider_router::ProviderRouter,
     providers::{codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore},
     types::*,
@@ -25,6 +26,7 @@ use axum::{
 };
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
@@ -44,6 +46,12 @@ pub struct ProxyState {
     pub gemini_shadow: Arc<GeminiShadowStore>,
     /// Codex Chat bridge history，用于恢复 previous_response_id 指向的 tool call
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
+    /// Durable receipts for Fabric-managed Claude provider hops.
+    pub route_events: Arc<RouteEventStore>,
+    /// True only while the owner-only route control socket is accepting clients.
+    pub route_control_available: Arc<std::sync::atomic::AtomicBool>,
+    /// Live TCP proxy address exposed only as port/reachability on the Unix control API.
+    pub bound_proxy_address: Arc<RwLock<Option<SocketAddr>>>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -57,6 +65,11 @@ pub struct ProxyServer {
     shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
     /// 服务器任务句柄，用于等待服务器实际关闭
     server_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    route_control_shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    route_control_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    route_control_socket_path: PathBuf,
 }
 
 impl ProxyServer {
@@ -70,6 +83,7 @@ impl ProxyServer {
         // 创建故障转移切换管理器
         let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
 
+        let settings_dir = crate::config::get_app_config_dir();
         let state = ProxyState {
             db,
             config: Arc::new(RwLock::new(config.clone())),
@@ -79,6 +93,9 @@ impl ProxyServer {
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            route_events: Arc::new(RouteEventStore::new(&settings_dir)),
+            route_control_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bound_proxy_address: Arc::new(RwLock::new(None)),
             app_handle,
             failover_manager,
         };
@@ -88,6 +105,11 @@ impl ProxyServer {
             state,
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            route_control_shutdown_tx: Arc::new(RwLock::new(None)),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            route_control_handle: Arc::new(RwLock::new(None)),
+            route_control_socket_path: control_socket_path(&settings_dir),
         }
     }
 
@@ -116,6 +138,25 @@ impl ProxyServer {
             .local_addr()
             .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
         let actual_port = local_addr.port();
+        *self.state.bound_proxy_address.write().await = Some(local_addr);
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let route_control_listener = match bind_route_control_socket(
+            &self.route_control_socket_path,
+        )
+        .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                log::error!("[RouteControl] managed route socket unavailable; Fabric-managed Claude calls will fail closed: {error}");
+                None
+            }
+        };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        self.state.route_control_available.store(
+            route_control_listener.is_some(),
+            std::sync::atomic::Ordering::Release,
+        );
 
         log::info!("[{}] 代理服务器启动于 {local_addr}", log_srv::STARTED);
 
@@ -210,10 +251,33 @@ impl ProxyServer {
             // 服务器停止后更新状态
             state.status.write().await.running = false;
             *state.start_time.write().await = None;
+            *state.bound_proxy_address.write().await = None;
         });
 
         // 保存服务器任务句柄
         *self.server_handle.write().await = Some(handle);
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            if let Some(route_control_listener) = route_control_listener {
+                let (route_shutdown_tx, route_shutdown_rx) = oneshot::channel();
+                *self.route_control_shutdown_tx.write().await = Some(route_shutdown_tx);
+                let route_app = self.build_route_control_router();
+                let route_path = self.route_control_socket_path.clone();
+                let route_control_available = self.state.route_control_available.clone();
+                let route_handle = tokio::spawn(async move {
+                    serve_route_control_socket(
+                        route_control_listener,
+                        route_app,
+                        route_path,
+                        route_control_available,
+                        route_shutdown_rx,
+                    )
+                    .await;
+                });
+                *self.route_control_handle.write().await = Some(route_handle);
+            }
+        }
 
         Ok(ProxyServerInfo {
             address: self.config.listen_address.clone(),
@@ -230,8 +294,17 @@ impl ProxyServer {
             return Err(ProxyError::NotRunning);
         }
 
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        self.state
+            .route_control_available
+            .store(false, std::sync::atomic::Ordering::Release);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(tx) = self.route_control_shutdown_tx.write().await.take() {
+            let _ = tx.send(());
+        }
+
         // 2. 等待服务器任务结束（带 5 秒超时保护）
-        if let Some(handle) = self.server_handle.write().await.take() {
+        let server_result = if let Some(handle) = self.server_handle.write().await.take() {
             match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {
                     log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
@@ -251,7 +324,21 @@ impl ProxyServer {
             }
         } else {
             Ok(())
+        };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(handle) = self.route_control_handle.write().await.take() {
+            let control_result =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(ProxyError::StopFailed(error.to_string())),
+                    Err(_) => Err(ProxyError::StopTimeout),
+                };
+            server_result.and(control_result)
+        } else {
+            server_result
         }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        server_result
     }
 
     pub async fn get_status(&self) -> ProxyStatus {
@@ -403,6 +490,21 @@ impl ProxyServer {
             .with_state(self.state.clone())
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn build_route_control_router(&self) -> Router {
+        Router::new()
+            .route(
+                "/managed/v1/route-events",
+                get(handlers::handle_managed_route_events),
+            )
+            .route(
+                "/managed/v1/route-events/seal",
+                post(handlers::handle_managed_route_seal),
+            )
+            .route("/managed/v1/info", get(handlers::handle_managed_route_info))
+            .with_state(self.state.clone())
+    }
+
     /// 在不重启服务的情况下更新运行时配置
     pub async fn apply_runtime_config(&self, config: &ProxyConfig) {
         *self.state.config.write().await = config.clone();
@@ -438,6 +540,135 @@ impl ProxyServer {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn bind_route_control_socket(
+    path: &std::path::Path,
+) -> std::io::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "control socket has no parent",
+        )
+    })?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata)
+            if metadata.file_type().is_dir() && metadata.uid() == unsafe { libc::geteuid() } =>
+        {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed route control directory is not an owned directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Err(error) => return Err(error),
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed route control path is not an owned socket",
+            ));
+        }
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "managed route control socket is already accepting connections",
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                std::fs::remove_file(path)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let listener = tokio::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn serve_route_control_socket(
+    listener: tokio::net::UnixListener,
+    app: Router,
+    socket_path: PathBuf,
+    route_control_available: Arc<std::sync::atomic::AtomicBool>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let expected_uid = unsafe { libc::geteuid() };
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::error!("[RouteControl] Unix socket accept failed: {error}");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let peer_uid = stream.peer_cred().map(|credentials| credentials.uid());
+                if peer_uid.as_ref().ok() != Some(&expected_uid) {
+                    log::warn!("[RouteControl] rejected Unix socket peer with mismatched uid");
+                    continue;
+                }
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            let mut router = app.clone();
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let request = http::Request::from_parts(
+                                    parts,
+                                    axum::body::Body::new(body),
+                                );
+                                <Router as tower::Service<http::Request<axum::body::Body>>>::call(
+                                    &mut router,
+                                    request,
+                                )
+                                .await
+                            }
+                        },
+                    );
+                    if let Err(error) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        log::debug!("[RouteControl] Unix HTTP connection ended: {error}");
+                    }
+                });
+            }
+            _ = &mut shutdown_rx => break,
+        }
+    }
+
+    let owned_socket = std::fs::symlink_metadata(&socket_path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == expected_uid);
+    if owned_socket {
+        if let Err(error) = std::fs::remove_file(&socket_path) {
+            log::warn!("[RouteControl] could not remove owned socket on shutdown: {error}");
+        }
+    }
+    route_control_available.store(false, std::sync::atomic::Ordering::Release);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,7 +676,70 @@ mod tests {
     use crate::AppError;
     use axum::http::{header, HeaderMap, StatusCode};
     use serde_json::{json, Value};
+    use serial_test::serial;
     use tokio::sync::Mutex;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn route_control_socket_is_private_and_rejects_a_second_listener() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = control_socket_path(dir.path());
+        let listener = bind_route_control_socket(&path).await.unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        let parent = std::fs::symlink_metadata(path.parent().unwrap()).unwrap();
+        assert!(parent.file_type().is_dir());
+        assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+
+        assert_eq!(
+            bind_route_control_socket(&path).await.unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        drop(listener);
+
+        // An owned stale socket can be replaced after the old listener is gone.
+        let replacement = bind_route_control_socket(&path).await.unwrap();
+        drop(replacement);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn route_control_socket_serves_http_only_after_peer_uid_validation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = control_socket_path(dir.path());
+        let listener = bind_route_control_socket(&path).await.unwrap();
+        let app = Router::new().route("/probe", get(|| async { "owner-only" }));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let server_available = available.clone();
+        let server_path = path.clone();
+        let handle = tokio::spawn(async move {
+            serve_route_control_socket(listener, app, server_path, server_available, shutdown_rx)
+                .await;
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        client
+            .write_all(b"GET /probe HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("owner-only"), "{response}");
+
+        shutdown_tx.send(()).unwrap();
+        handle.await.unwrap();
+        assert!(!path.exists());
+        assert!(!available.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[derive(Debug)]
     struct CapturedRequest {
@@ -458,6 +752,7 @@ mod tests {
     /// must derive the sibling standalone endpoint instead of having the
     /// standalone path appended to it.
     #[tokio::test]
+    #[serial]
     async fn codex_standalone_endpoints_derive_from_pasted_full_base_url() {
         let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
         let capture_handler = {
@@ -618,6 +913,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn codex_images_generation_aliases_forward_and_record_usage() {
         let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
         let mock_app = Router::new().route(
@@ -823,6 +1119,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn codex_images_edit_aliases_forward_and_record_usage() {
         // Real Images API responses carry `input_tokens_details` with text/image
         // splits; the shared Codex usage parser must tolerate them.
@@ -1044,6 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn alpha_search_routes_forward_to_canonical_upstream() {
         let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
         let mock_app = Router::new().route(

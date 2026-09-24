@@ -116,6 +116,111 @@ impl ProxyResponse {
         }
     }
 
+    /// Records upstream-body completion without treating response headers as terminal.
+    pub fn track_managed_route_terminal(
+        self,
+        observer: super::managed_route_events::ManagedHopObserver,
+        upstream_model: Option<String>,
+    ) -> Self {
+        let status = self.status();
+        let headers = self.headers().clone();
+        let status_code = status.as_u16();
+        let successful_status = status.is_success();
+        let stream = self.bytes_stream();
+        let tracked = futures::stream::unfold(
+            (
+                stream,
+                observer,
+                upstream_model,
+                status_code,
+                successful_status,
+                false,
+            ),
+            |(
+                mut stream,
+                observer,
+                upstream_model,
+                status_code,
+                successful_status,
+                terminal_seen,
+            )| async move {
+                match stream.next().await {
+                    Some(Ok(bytes)) => Some((
+                        Ok(bytes),
+                        (
+                            stream,
+                            observer,
+                            upstream_model,
+                            status_code,
+                            successful_status,
+                            terminal_seen,
+                        ),
+                    )),
+                    Some(Err(error)) => {
+                        if terminal_seen {
+                            return None;
+                        }
+                        let terminal_error = observer
+                            .started_event()
+                            .filter(|_| !terminal_seen)
+                            .and_then(|started| {
+                                observer
+                                    .finish(
+                                        &started,
+                                        upstream_model,
+                                        Some(status_code),
+                                        "upstream_stream_error",
+                                    )
+                                    .err()
+                            });
+                        if terminal_error.is_some() {
+                            log::error!(
+                                "[Claude] managed route terminal receipt could not be persisted; outcome remains unknown"
+                            );
+                        }
+                        Some((
+                            Err(terminal_error.map_or(error, |_| {
+                                std::io::Error::other(
+                                    "managed route terminal receipt persistence failed",
+                                )
+                            })),
+                            (stream, observer, None, status_code, successful_status, true),
+                        ))
+                    }
+                    None => {
+                        if terminal_seen {
+                            return None;
+                        }
+                        let outcome = if successful_status {
+                            "upstream_body_complete"
+                        } else {
+                            "upstream_http_error_body_complete"
+                        };
+                        let terminal_error = observer.started_event().and_then(|started| {
+                            observer
+                                .finish(&started, upstream_model, Some(status_code), outcome)
+                                .err()
+                        });
+                        if terminal_error.is_some() {
+                            log::error!(
+                                "[Claude] managed route terminal receipt could not be persisted; outcome remains unknown"
+                            );
+                            Some((
+                                Err(std::io::Error::other(
+                                    "managed route terminal receipt persistence failed",
+                                )),
+                                (stream, observer, None, status_code, successful_status, true),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            },
+        );
+        Self::streamed(status, headers, tracked)
+    }
+
     pub fn status(&self) -> http::StatusCode {
         match self {
             Self::Hyper(r) => r.status(),
@@ -771,6 +876,223 @@ impl<S: Unpin> tokio::io::AsyncWrite for WriteFilter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_route_terminal_waits_for_upstream_body_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            dir.path(),
+        ));
+        let call = super::super::managed_route_events::ManagedRouteCall::new(
+            store.clone(),
+            "attempt-stream".to_string(),
+            "call-1".to_string(),
+            "claude-sonnet".to_string(),
+        );
+        let observer = super::super::managed_route_events::ManagedHopObserver::new(call);
+        observer
+            .start("provider-1", Some("upstream-model"))
+            .unwrap();
+        observer.record_headers(200).unwrap();
+        let response = ProxyResponse::streamed(
+            http::StatusCode::OK,
+            http::HeaderMap::new(),
+            futures::stream::iter([
+                Ok(Bytes::from_static(b"chunk-1")),
+                Ok(Bytes::from_static(b"chunk-2")),
+            ]),
+        )
+        .track_managed_route_terminal(observer, Some("upstream-model".to_string()));
+
+        let page = store.read_page("attempt-stream", 0, None, 10).unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(
+            page.events[1].event_type,
+            super::super::managed_route_events::RouteEventType::HopHeaders
+        );
+
+        let body = response.bytes_with_limit(1024).await.unwrap();
+        assert_eq!(body, Bytes::from_static(b"chunk-1chunk-2"));
+        let page = store.read_page("attempt-stream", 0, None, 10).unwrap();
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(
+            page.events[2].event_type,
+            super::super::managed_route_events::RouteEventType::HopFinished
+        );
+        assert_eq!(page.events[2].status_code, Some(200));
+        assert_eq!(
+            page.events[2].outcome.as_deref(),
+            Some("upstream_body_complete")
+        );
+        assert_eq!(page.events[0].hop_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_upstream_stream_leaves_started_and_headers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            dir.path(),
+        ));
+        let call = super::super::managed_route_events::ManagedRouteCall::new(
+            store.clone(),
+            "attempt-cancelled".to_string(),
+            "call-1".to_string(),
+            "claude-sonnet".to_string(),
+        );
+        let observer = super::super::managed_route_events::ManagedHopObserver::new(call);
+        observer
+            .start("provider-1", Some("upstream-model"))
+            .unwrap();
+        observer.record_headers(200).unwrap();
+        let response = ProxyResponse::streamed(
+            http::StatusCode::OK,
+            http::HeaderMap::new(),
+            futures::stream::pending(),
+        )
+        .track_managed_route_terminal(observer, Some("upstream-model".to_string()));
+        drop(response);
+
+        let page = store.read_page("attempt-cancelled", 0, None, 10).unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(
+            page.events[1].outcome.as_deref(),
+            Some("response_headers_received")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_2xx_body_is_closed_once_with_upstream_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            dir.path(),
+        ));
+        let call = super::super::managed_route_events::ManagedRouteCall::new(
+            store.clone(),
+            "attempt-http-error".to_string(),
+            "call-1".to_string(),
+            "claude-sonnet".to_string(),
+        );
+        let observer = super::super::managed_route_events::ManagedHopObserver::new(call);
+        observer
+            .start("provider-1", Some("upstream-model"))
+            .unwrap();
+        observer.record_headers(429).unwrap();
+        let response = ProxyResponse::streamed(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            http::HeaderMap::new(),
+            futures::stream::iter([Ok(Bytes::from_static(b"rate limited"))]),
+        )
+        .track_managed_route_terminal(observer.clone(), Some("upstream-model".to_string()));
+
+        assert_eq!(
+            response.bytes_with_limit(1024).await.unwrap(),
+            Bytes::from_static(b"rate limited")
+        );
+        assert!(observer
+            .finish(
+                &observer.started_event().unwrap(),
+                Some("upstream-model".to_string()),
+                Some(429),
+                "duplicate_finish",
+            )
+            .is_ok());
+        let page = store.read_page("attempt-http-error", 0, None, 10).unwrap();
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.events[2].status_code, Some(429));
+        assert_eq!(
+            page.events[2].outcome.as_deref(),
+            Some("upstream_http_error_body_complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_stream_error_closes_once_without_claiming_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            dir.path(),
+        ));
+        let call = super::super::managed_route_events::ManagedRouteCall::new(
+            store.clone(),
+            "attempt-stream-error".to_string(),
+            "call-1".to_string(),
+            "claude-sonnet".to_string(),
+        );
+        let observer = super::super::managed_route_events::ManagedHopObserver::new(call);
+        observer
+            .start("provider-1", Some("upstream-model"))
+            .unwrap();
+        observer.record_headers(200).unwrap();
+        let response = ProxyResponse::streamed(
+            http::StatusCode::OK,
+            http::HeaderMap::new(),
+            futures::stream::iter([Err(std::io::Error::other("mock stream failure"))]),
+        )
+        .track_managed_route_terminal(observer.clone(), Some("upstream-model".to_string()));
+
+        let error = response.bytes_with_limit(1024).await.unwrap_err();
+        assert!(matches!(error, ProxyError::ForwardFailed(_)));
+        assert!(observer
+            .finish(
+                &observer.started_event().unwrap(),
+                Some("upstream-model".to_string()),
+                Some(200),
+                "duplicate_finish",
+            )
+            .is_ok());
+        let page = store
+            .read_page("attempt-stream-error", 0, None, 10)
+            .unwrap();
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.events[2].status_code, Some(200));
+        assert_eq!(
+            page.events[2].outcome.as_deref(),
+            Some("upstream_stream_error")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_receipt_write_failure_is_observable_and_never_successful() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            dir.path(),
+        ));
+        let call = super::super::managed_route_events::ManagedRouteCall::new(
+            store.clone(),
+            "attempt-receipt-failure".to_string(),
+            "call-1".to_string(),
+            "claude-sonnet".to_string(),
+        );
+        let observer = super::super::managed_route_events::ManagedHopObserver::new(call);
+        observer
+            .start("provider-1", Some("upstream-model"))
+            .unwrap();
+        observer.record_headers(503).unwrap();
+        let lock_path = dir.path().join("managed-route-events.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        let response = ProxyResponse::streamed(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            http::HeaderMap::new(),
+            futures::stream::iter([Ok(Bytes::from_static(b"unavailable"))]),
+        )
+        .track_managed_route_terminal(observer.clone(), Some("upstream-model".to_string()));
+
+        assert!(matches!(
+            response.bytes_with_limit(1024).await,
+            Err(ProxyError::ForwardFailed(_))
+        ));
+        assert!(observer.terminal_persistence_failed());
+        std::fs::remove_dir(&lock_path).unwrap();
+        std::fs::File::create(&lock_path).unwrap();
+        let page = store
+            .read_page("attempt-receipt-failure", 0, None, 10)
+            .unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(
+            page.events[1].outcome.as_deref(),
+            Some("response_headers_received")
+        );
+    }
 
     fn buffered_with_content_type(content_type: Option<&str>) -> ProxyResponse {
         let mut headers = http::HeaderMap::new();

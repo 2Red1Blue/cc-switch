@@ -526,7 +526,7 @@ impl RequestForwarder {
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
             match self
-                .forward(
+                .forward_tracked(
                     app_type,
                     &method,
                     provider,
@@ -625,7 +625,7 @@ impl RequestForwarder {
                             );
 
                             match self
-                                .forward(
+                                .forward_tracked(
                                     app_type,
                                     &method,
                                     provider,
@@ -771,7 +771,7 @@ impl RequestForwarder {
 
                                 // 使用同一供应商重试（不计入熔断器）
                                 match self
-                                    .forward(
+                                    .forward_tracked(
                                         app_type,
                                         &method,
                                         provider,
@@ -937,7 +937,7 @@ impl RequestForwarder {
 
                             // 使用同一供应商重试（不计入熔断器）
                             match self
-                                .forward(
+                                .forward_tracked(
                                     app_type,
                                     &method,
                                     provider,
@@ -1153,6 +1153,87 @@ impl RequestForwarder {
             error: last_error.unwrap_or(ProxyError::MaxRetriesExceeded),
             provider: last_provider,
         })
+    }
+
+    /// Forwards one provider call and closes its receipt only on an observed outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_tracked(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        let observer = if app_type.as_str() == "claude" {
+            extensions
+                .get::<super::managed_route_events::ManagedRouteCall>()
+                .cloned()
+                .map(super::managed_route_events::ManagedHopObserver::new)
+        } else {
+            None
+        };
+        let mut tracked_extensions = extensions.clone();
+        if let Some(observer) = &observer {
+            tracked_extensions.insert(observer.clone());
+        }
+
+        let result = self
+            .forward(
+                app_type,
+                method,
+                provider,
+                endpoint,
+                body,
+                headers,
+                &tracked_extensions,
+                adapter,
+            )
+            .await;
+
+        if observer
+            .as_ref()
+            .is_some_and(|observer| observer.terminal_persistence_failed())
+        {
+            return Err(ProxyError::ManagedRouteReceiptPersistenceFailed);
+        }
+
+        if let (Some(observer), Err(error)) = (&observer, &result) {
+            if let Some(started) = observer.started_event() {
+                // Once response headers were observed, only the body stream wrapper may
+                // write terminal completion. A local body limit or downstream cancellation
+                // leaves started/headers-only evidence instead of claiming a full stream.
+                if observer.observed_status_code().is_none() {
+                    let (status_code, outcome) = match error {
+                        ProxyError::UpstreamError { status, .. } => {
+                            (Some(*status), "upstream_http_error")
+                        }
+                        ProxyError::Timeout(_) => (None, "transport_timeout"),
+                        ProxyError::ForwardFailed(_) => (None, "transport_or_stream_error"),
+                        _ => (None, "proxy_processing_error"),
+                    };
+                    if observer
+                        .finish(
+                            &started,
+                            started.upstream_model.clone(),
+                            status_code,
+                            outcome,
+                        )
+                        .is_err()
+                    {
+                        log::error!(
+                            "[Claude] managed route terminal receipt could not be persisted; outcome remains unknown"
+                        );
+                        return Err(ProxyError::ManagedRouteReceiptPersistenceFailed);
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// 转发单个请求（使用适配器）
@@ -2035,6 +2116,12 @@ impl RequestForwarder {
         for (key, value) in headers {
             let key_str = key.as_str();
 
+            // Fabric correlation is a local routing signal and never leaves this proxy,
+            // including when it arrives on a non-Claude ingress path.
+            if super::managed_route_events::is_reserved_correlation_header(key) {
+                continue;
+            }
+
             // --- host — 原位替换为上游 host（保持客户端原始位置） ---
             if key_str.eq_ignore_ascii_case("host") {
                 if let Some(ref host_val) = upstream_host {
@@ -2286,6 +2373,9 @@ impl RequestForwarder {
                 .and_then(|meta| meta.local_proxy_request_overrides.as_ref()),
             is_copilot,
         );
+        // A provider-local header override must not reintroduce the reserved Fabric
+        // correlation marker after it has been removed from inbound headers.
+        ordered_headers.remove(super::managed_route_events::CORRELATION_HEADER);
 
         // 托管 OAuth 的 workspace 由账号绑定决定，覆盖客户端或本地代理配置的旧值。
         if let Some(ref account_id) = codex_oauth_account_id {
@@ -2343,6 +2433,19 @@ impl RequestForwarder {
             is_copilot,
         );
 
+        let route_observer = extensions.get::<super::managed_route_events::ManagedHopObserver>();
+        if let Some(observer) = route_observer {
+            observer
+                .start(&provider.id, outbound_model.as_deref())
+                .map_err(|error| {
+                    if super::managed_route_events::is_storage_full_error(&error) {
+                        ProxyError::ManagedRouteStorageFull
+                    } else {
+                        ProxyError::ManagedRouteReceiptPersistenceFailed
+                    }
+                })?;
+        }
+
         // 发送请求
         let response = if is_socks_proxy || !preserve_exact_header_case {
             // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
@@ -2399,6 +2502,18 @@ impl RequestForwarder {
                 upstream_proxy_url.as_deref(),
             )
             .await?
+        };
+        let response = match route_observer {
+            Some(observer) => {
+                let status_code = response.status().as_u16();
+                if observer.record_headers(status_code).is_err() {
+                    log::error!(
+                        "[Claude] managed route response-headers receipt could not be persisted; terminal evidence may be incomplete"
+                    );
+                }
+                response.track_managed_route_terminal(observer.clone(), outbound_model.clone())
+            }
+            None => response,
         };
 
         // 检查响应状态
@@ -2818,6 +2933,10 @@ impl RequestForwarder {
             ProxyError::StreamIdleTimeout(_) => ErrorCategory::Retryable,
             // 无可用供应商：所有供应商都试过了，无法重试
             ProxyError::NoAvailableProvider => ErrorCategory::NonRetryable,
+            // A managed hop whose terminal receipt failed is UNKNOWN. Reusing a
+            // second provider could duplicate billable work, so failover is forbidden.
+            ProxyError::ManagedRouteReceiptPersistenceFailed => ErrorCategory::NonRetryable,
+            ProxyError::ManagedRouteStorageFull => ErrorCategory::NonRetryable,
             // 其他错误（数据库/内部错误等）：不是换供应商能解决的问题
             _ => ErrorCategory::NonRetryable,
         }
@@ -4643,6 +4762,21 @@ mod tests {
             ),
             ErrorCategory::NonRetryable
         );
+    }
+
+    #[test]
+    fn managed_receipt_persistence_failure_is_not_retryable() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_type(None);
+        for error in [
+            ProxyError::ManagedRouteReceiptPersistenceFailed,
+            ProxyError::ManagedRouteStorageFull,
+        ] {
+            assert_eq!(
+                forwarder.categorize_proxy_error(&error, &provider),
+                ErrorCategory::NonRetryable
+            );
+        }
     }
 
     #[test]

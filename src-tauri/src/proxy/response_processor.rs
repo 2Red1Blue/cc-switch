@@ -1028,6 +1028,11 @@ mod tests {
             provider_router: Arc::new(ProviderRouter::new(db.clone())),
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            route_events: Arc::new(crate::proxy::managed_route_events::RouteEventStore::new(
+                std::env::temp_dir().join(format!("cc-switch-test-{}", uuid::Uuid::new_v4())),
+            )),
+            route_control_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bound_proxy_address: Arc::new(RwLock::new(None)),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }

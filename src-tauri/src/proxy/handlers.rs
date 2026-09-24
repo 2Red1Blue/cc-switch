@@ -48,7 +48,12 @@ use super::{
 };
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
@@ -174,8 +179,49 @@ async fn handle_messages_for_app(
     let (parts, body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
-    let extensions = parts.extensions;
+    let mut headers = parts.headers;
+    let mut extensions = parts.extensions;
+    let managed_correlation_id = if app_type.as_str() == "claude" {
+        take_managed_route_correlation(&mut headers)?
+    } else {
+        headers.remove(super::managed_route_events::CORRELATION_HEADER);
+        None
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if managed_correlation_id.is_some()
+        && !state
+            .route_control_available
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(ProxyError::InvalidRequest(
+            "managed route control socket is unavailable; upstream send refused".to_string(),
+        ));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    if managed_correlation_id.is_some() {
+        return Err(ProxyError::InvalidRequest(
+            "Fabric-managed route receipts are unsupported on Windows".to_string(),
+        ));
+    }
+    let managed_call_lease = if let Some(correlation_id) = managed_correlation_id.as_deref() {
+        Some(
+            state
+                .route_events
+                .register_call(correlation_id)
+                .map_err(|error| {
+                    if super::managed_route_events::is_storage_full_error(&error) {
+                        ProxyError::ManagedRouteStorageFull
+                    } else {
+                        ProxyError::InvalidRequest(
+                            "managed route correlation is closed or unavailable; upstream send refused"
+                                .to_string(),
+                        )
+                    }
+                })?,
+        )
+    } else {
+        None
+    };
     let body_bytes = body
         .collect()
         .await
@@ -183,6 +229,18 @@ async fn handle_messages_for_app(
         .to_bytes();
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+
+    if let Some(correlation_id) = managed_correlation_id.as_deref() {
+        extensions.insert(super::managed_route_events::ManagedRouteCall::new(
+            state.route_events.clone(),
+            correlation_id.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            body.get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        ));
+    }
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
@@ -244,8 +302,8 @@ async fn handle_messages_for_app(
     let needs_transform = adapter.needs_transform(&ctx.provider);
 
     // Claude 特有：格式转换处理
-    if needs_transform {
-        return handle_claude_transform(
+    let response = if needs_transform {
+        handle_claude_transform(
             response,
             &ctx,
             &state,
@@ -254,18 +312,102 @@ async fn handle_messages_for_app(
             &api_format,
             connection_guard,
         )
-        .await;
-    }
+        .await?
+    } else {
+        // 通用响应处理（透传模式）
+        process_response(
+            response,
+            &ctx,
+            &state,
+            &CLAUDE_PARSER_CONFIG,
+            connection_guard,
+        )
+        .await?
+    };
+    Ok(match managed_call_lease {
+        Some(lease) => hold_managed_call_lease(response, lease),
+        None => response,
+    })
+}
 
-    // 通用响应处理（透传模式）
-    process_response(
-        response,
-        &ctx,
-        &state,
-        &CLAUDE_PARSER_CONFIG,
-        connection_guard,
-    )
-    .await
+fn hold_managed_call_lease(
+    response: axum::response::Response,
+    lease: super::managed_route_events::ManagedCallLease,
+) -> axum::response::Response {
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream();
+    let held = futures::stream::unfold((stream, lease), |(mut stream, lease)| async move {
+        stream.next().await.map(|chunk| (chunk, (stream, lease)))
+    });
+    axum::response::Response::from_parts(parts, axum::body::Body::from_stream(held))
+}
+
+fn take_managed_route_correlation(headers: &mut HeaderMap) -> Result<Option<String>, ProxyError> {
+    use super::managed_route_events::{validate_correlation_id, CORRELATION_HEADER};
+
+    let values = headers.get_all(CORRELATION_HEADER);
+    let count = values.iter().count();
+    if count == 0 {
+        return Ok(None);
+    }
+    if count != 1 {
+        return Err(ProxyError::InvalidRequest(
+            "Fabric attempt correlation header must occur exactly once".to_string(),
+        ));
+    }
+    let value = values
+        .iter()
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            ProxyError::InvalidRequest("Fabric attempt correlation header is invalid".to_string())
+        })?;
+    validate_correlation_id(value).map_err(|_| {
+        ProxyError::InvalidRequest("Fabric attempt correlation header is invalid".to_string())
+    })?;
+    let correlation_id = value.to_string();
+    headers.remove(CORRELATION_HEADER);
+    Ok(Some(correlation_id))
+}
+
+/// Returns route receipts to the authenticated Unix control-socket peer.
+pub async fn handle_managed_route_events(
+    State(state): State<ProxyState>,
+    Query(query): Query<super::managed_route_events::RouteEventsQuery>,
+) -> Result<Json<super::managed_route_events::RouteEventsPage>, StatusCode> {
+    let page = state
+        .route_events
+        .read_page(
+            &query.correlation_id,
+            query.after,
+            query.through,
+            query.limit,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(page))
+}
+
+/// Durably closes one Fabric correlation and waits for admitted calls to quiesce.
+pub async fn handle_managed_route_seal(
+    State(state): State<ProxyState>,
+    Query(query): Query<super::managed_route_events::RouteSealQuery>,
+) -> Result<Json<super::managed_route_events::RouteSealResponse>, StatusCode> {
+    let timeout = std::time::Duration::from_millis(query.timeout_ms.min(120_000));
+    state
+        .route_events
+        .seal(&query.correlation_id, timeout)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Returns the live non-secret TCP listener identity for Claude child preflight.
+pub async fn handle_managed_route_info(
+    State(state): State<ProxyState>,
+) -> Json<super::managed_route_events::RouteControlInfo> {
+    Json(super::managed_route_events::route_control_info(
+        *state.bound_proxy_address.read().await,
+    ))
 }
 
 fn validate_claude_desktop_gateway_auth(
@@ -2046,6 +2188,8 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::UpstreamError { .. } => "cc_switch_upstream_error",
         ProxyError::DatabaseError(_) => "cc_switch_database_error",
         ProxyError::Internal(_) => "cc_switch_internal_error",
+        ProxyError::ManagedRouteReceiptPersistenceFailed => "cc_switch_proxy_error",
+        ProxyError::ManagedRouteStorageFull => "cc_switch_proxy_error",
         ProxyError::AlreadyRunning
         | ProxyError::NotRunning
         | ProxyError::BindFailed(_)
@@ -2858,9 +3002,9 @@ async fn log_usage(
 mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, responses_sse_stream_to_anthropic_message,
-        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error,
+        codex_proxy_error_json, hold_managed_call_lease, responses_sse_stream_to_anthropic_message,
+        responses_sse_to_response_value, should_use_claude_transform_streaming,
+        take_managed_route_correlation, transform, upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
     use bytes::Bytes;
@@ -2868,6 +3012,74 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[test]
+    fn managed_correlation_header_is_validated_and_removed_before_forwarding() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            super::super::managed_route_events::CORRELATION_HEADER,
+            "attempt_123".parse().unwrap(),
+        );
+        headers.insert("x-client-only", "still-present".parse().unwrap());
+
+        assert_eq!(
+            take_managed_route_correlation(&mut headers)
+                .unwrap()
+                .as_deref(),
+            Some("attempt_123")
+        );
+        assert!(!headers.contains_key(super::super::managed_route_events::CORRELATION_HEADER));
+        assert_eq!(headers["x-client-only"], "still-present");
+    }
+
+    #[test]
+    fn malformed_or_duplicate_managed_correlation_header_is_rejected() {
+        let mut malformed = axum::http::HeaderMap::new();
+        malformed.insert(
+            super::super::managed_route_events::CORRELATION_HEADER,
+            "".parse().unwrap(),
+        );
+        assert!(take_managed_route_correlation(&mut malformed).is_err());
+
+        let mut duplicated = axum::http::HeaderMap::new();
+        duplicated.append(
+            super::super::managed_route_events::CORRELATION_HEADER,
+            "attempt-a".parse().unwrap(),
+        );
+        duplicated.append(
+            super::super::managed_route_events::CORRELATION_HEADER,
+            "attempt-b".parse().unwrap(),
+        );
+        assert!(take_managed_route_correlation(&mut duplicated).is_err());
+    }
+
+    #[tokio::test]
+    async fn final_response_body_holds_seal_lease_until_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            dir.path(),
+        ));
+        let lease = store.register_call("attempt-body").unwrap();
+        let body = axum::body::Body::from_stream(futures::stream::pending::<
+            Result<Bytes, std::io::Error>,
+        >());
+        let response = hold_managed_call_lease(axum::response::Response::new(body), lease);
+
+        let incomplete = store
+            .seal("attempt-body", std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(!incomplete.sealed);
+        assert_eq!(incomplete.active_calls, 1);
+        drop(response);
+
+        let complete = store
+            .seal("attempt-body", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(complete.sealed);
+        assert_eq!(complete.active_calls, 0);
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {

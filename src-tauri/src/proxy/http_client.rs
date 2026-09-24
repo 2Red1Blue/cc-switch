@@ -29,8 +29,26 @@ pub fn set_proxy_port(port: u16) {
             log::debug!("[GlobalProxy] Updated CC Switch proxy port to {port}");
         }
     } else {
-        let _ = CC_SWITCH_PROXY_PORT.set(RwLock::new(port));
-        log::debug!("[GlobalProxy] Initialized CC Switch proxy port to {port}");
+        if CC_SWITCH_PROXY_PORT.set(RwLock::new(port)).is_ok() {
+            log::debug!("[GlobalProxy] Initialized CC Switch proxy port to {port}");
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ProxyPortTestGuard(u16);
+
+#[cfg(test)]
+impl ProxyPortTestGuard {
+    pub(crate) fn capture() -> Self {
+        Self(get_proxy_port())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProxyPortTestGuard {
+    fn drop(&mut self) {
+        set_proxy_port(self.0);
     }
 }
 
@@ -342,6 +360,7 @@ pub fn mask_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -408,6 +427,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_proxy_points_to_loopback() {
         // 设置 CC Switch 代理端口为 15721（默认值）
         set_proxy_port(15721);
@@ -427,6 +447,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_system_proxy_points_to_loopback() {
         let _guard = env_lock().lock().unwrap();
 
