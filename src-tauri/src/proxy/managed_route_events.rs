@@ -7,8 +7,15 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
+
+static ROUTE_EVENT_PROCESS_INSTANCE_ID: OnceLock<String> = OnceLock::new();
+
+/// Identifies live stores in this process separately from leases left by an earlier process.
+fn route_event_process_instance_id() -> &'static str {
+    ROUTE_EVENT_PROCESS_INSTANCE_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
 
 pub const CORRELATION_HEADER: &str = "x-fabric-managed-attempt-id";
 const MAX_PAGE_SIZE: usize = 500;
@@ -75,9 +82,12 @@ impl Drop for ManagedCallLease {
         let Ok(mut state) = self.activity.state.lock() else {
             return;
         };
-        if let Err(error) =
-            release_durable_call_lease(&self.settings_dir, &self.correlation_id, &self.call_id)
-        {
+        if let Err(error) = release_durable_call_lease(
+            &self.settings_dir,
+            &self.correlation_id,
+            &self.call_id,
+            route_event_process_instance_id(),
+        ) {
             log::error!("[RouteReceipt] failed to release admitted call lease: {error}");
         }
         state.active_calls = state.active_calls.saturating_sub(1);
@@ -96,6 +106,7 @@ fn release_durable_call_lease(
     settings_dir: &Path,
     correlation_id: &str,
     call_id: &str,
+    process_instance_id: &str,
 ) -> std::io::Result<()> {
     ensure_settings_dir(settings_dir)?;
     let events_dir = settings_dir.join("managed-route-events");
@@ -109,6 +120,12 @@ fn release_durable_call_lease(
             "managed route admission lease lost its durable seal state",
         )
     })?;
+    if seal.active_call_owner.as_deref() != Some(process_instance_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed route admission lease owner changed",
+        ));
+    }
     let position = seal
         .active_call_ids
         .iter()
@@ -120,6 +137,9 @@ fn release_durable_call_lease(
             )
         })?;
     seal.active_call_ids.remove(position);
+    if seal.active_call_ids.is_empty() {
+        seal.active_call_owner = None;
+    }
     write_seal_state(&seal_path, &seal)
 }
 
@@ -381,6 +401,9 @@ struct DurableSealState {
     /// Request call IDs admitted before ingress closed and not yet released.
     #[serde(default)]
     active_call_ids: Vec<String>,
+    /// Process instance allowed to extend the current active call set.
+    #[serde(default)]
+    active_call_owner: Option<String>,
     pending_hops: u64,
     #[serde(default)]
     event_count: u64,
@@ -882,6 +905,7 @@ impl RouteEventStore {
                     correlation_id: correlation_id.to_string(),
                     ingress_closed: false,
                     active_call_ids: Vec::new(),
+                    active_call_owner: None,
                     pending_hops: 0,
                     event_count: 0,
                     reserved_hops: 0,
@@ -898,8 +922,10 @@ impl RouteEventStore {
                 "Fabric correlation has been sealed; new calls are rejected",
             ));
         }
-        if state.active_calls == 0
-            && (!durable.active_call_ids.is_empty() || durable.pending_hops > 0)
+        let same_live_process_owner = !durable.active_call_ids.is_empty()
+            && durable.active_call_owner.as_deref() == Some(route_event_process_instance_id());
+        if (!durable.active_call_ids.is_empty() || durable.pending_hops > 0)
+            && !same_live_process_owner
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -911,6 +937,7 @@ impl RouteEventStore {
             durable.metadata_reserved = true;
         }
         self.remember_current_locked()?;
+        durable.active_call_owner = Some(route_event_process_instance_id().to_string());
         durable.active_call_ids.push(call_id.clone());
         write_seal_state(&path, &durable)?;
         state.seal_checked = true;
@@ -1116,6 +1143,7 @@ impl RouteEventStore {
                     correlation_id: event.correlation_id.clone(),
                     ingress_closed: false,
                     active_call_ids: Vec::new(),
+                    active_call_owner: None,
                     pending_hops: 0,
                     event_count: 0,
                     reserved_hops: 0,
@@ -2370,6 +2398,45 @@ mod tests {
         assert_eq!(seal.high_watermark, Some(3));
     }
 
+    #[test]
+    fn stores_in_the_same_process_can_admit_concurrent_calls() {
+        let dir = tempdir().unwrap();
+        let first_store = RouteEventStore::new(dir.path());
+        let first_lease = first_store.register_call("attempt-shared-owner").unwrap();
+        let second_store = RouteEventStore::new(dir.path());
+        let second_lease = second_store
+            .register_call("attempt-shared-owner")
+            .expect("same-process stores share the active admission owner");
+
+        assert_ne!(first_lease.call_id(), second_lease.call_id());
+        let seal_path = first_store.seal_path("attempt-shared-owner");
+        let durable = read_seal_state(&seal_path, "attempt-shared-owner")
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.active_call_ids.len(), 2);
+        assert_eq!(
+            durable.active_call_owner.as_deref(),
+            Some(route_event_process_instance_id())
+        );
+
+        drop(first_lease);
+        let durable = read_seal_state(&seal_path, "attempt-shared-owner")
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.active_call_ids, vec![second_lease.call_id()]);
+        assert_eq!(
+            durable.active_call_owner.as_deref(),
+            Some(route_event_process_instance_id())
+        );
+
+        drop(second_lease);
+        let durable = read_seal_state(&seal_path, "attempt-shared-owner")
+            .unwrap()
+            .unwrap();
+        assert!(durable.active_call_ids.is_empty());
+        assert_eq!(durable.active_call_owner, None);
+    }
+
     #[tokio::test]
     async fn replacement_store_never_seals_an_unreleased_call_lease() {
         let dir = tempdir().unwrap();
@@ -2377,7 +2444,17 @@ mod tests {
         let lease = original.register_call("attempt-crashed-call").unwrap();
         std::mem::forget(lease);
 
+        let mut durable = read_seal_state(
+            &original.seal_path("attempt-crashed-call"),
+            "attempt-crashed-call",
+        )
+        .unwrap()
+        .unwrap();
+        durable.active_call_owner = Some("previous-process-instance".to_string());
+        write_seal_state(&original.seal_path("attempt-crashed-call"), &durable).unwrap();
+
         let replacement = RouteEventStore::new(dir.path());
+        assert!(replacement.register_call("attempt-crashed-call").is_err());
         let seal = replacement
             .seal("attempt-crashed-call", std::time::Duration::from_millis(5))
             .await
@@ -2484,6 +2561,7 @@ mod tests {
                 correlation_id: "attempt-omission".to_string(),
                 ingress_closed: true,
                 active_call_ids: Vec::new(),
+                active_call_owner: None,
                 pending_hops: 0,
                 event_count: 3,
                 reserved_hops: 0,
