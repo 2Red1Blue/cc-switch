@@ -4787,13 +4787,26 @@ mod tests {
     async fn response_headers_receipt_failure_does_not_fail_over() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
+            directory.path(),
+        ));
+        let _call_lease = store
+            .register_call("attempt-header-receipt-failure")
+            .unwrap();
+        let conflicting_event = directory
+            .path()
+            .join("managed-route-events/00000000000000000002.json");
         let handler_attempts = attempts.clone();
+        let handler_conflicting_event = conflicting_event.clone();
         let app = axum::Router::new().route(
             "/v1/messages",
             axum::routing::post(move || {
                 let attempts = handler_attempts.clone();
+                let conflicting_event = handler_conflicting_event.clone();
                 async move {
                     attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    std::fs::write(&conflicting_event, b"occupied event sequence").unwrap();
                     (StatusCode::SERVICE_UNAVAILABLE, "upstream unavailable")
                 }
             }),
@@ -4805,18 +4818,6 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-
-        let directory = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
-            directory.path(),
-        ));
-        let _call_lease = store
-            .register_call("attempt-header-receipt-failure")
-            .unwrap();
-        let temporary_event = directory
-            .path()
-            .join("managed-route-events/.00000000000000000002.tmp");
-        std::fs::write(&temporary_event, b"ambiguous partial event").unwrap();
 
         let call = super::super::managed_route_events::ManagedRouteCall::new(
             store.clone(),
@@ -4868,14 +4869,6 @@ mod tests {
             })
         ));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::Acquire), 1);
-        let page = store
-            .read_page("attempt-header-receipt-failure", 0, None, 10)
-            .unwrap();
-        assert_eq!(page.events.len(), 1);
-        assert_eq!(
-            page.events[0].event_type,
-            super::super::managed_route_events::RouteEventType::HopStarted
-        );
 
         server.abort();
     }

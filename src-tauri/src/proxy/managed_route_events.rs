@@ -253,6 +253,8 @@ pub struct RouteEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+// The `hop_` prefix is part of the persisted and control-socket event vocabulary.
+#[allow(clippy::enum_variant_names)]
 pub enum RouteEventType {
     HopStarted,
     HopHeaders,
@@ -795,10 +797,7 @@ impl RouteEventStore {
     /// Registers a correlation before body processing so sealing cannot miss ingress.
     pub fn register_call(&self, correlation_id: &str) -> std::io::Result<ManagedCallLease> {
         let result = self.register_call_inner(correlation_id);
-        if result
-            .as_ref()
-            .is_err_and(|error| should_reconcile_after_error(error))
-        {
+        if result.as_ref().is_err_and(should_reconcile_after_error) {
             self.reconciled
                 .store(false, std::sync::atomic::Ordering::Release);
         }
@@ -1004,10 +1003,7 @@ impl RouteEventStore {
     /// Atomically allocates a global sequence and publishes an immutable event file.
     pub fn append(&self, event: RouteEvent) -> std::io::Result<()> {
         let result = self.append_inner(event);
-        if result
-            .as_ref()
-            .is_err_and(|error| should_reconcile_after_error(error))
-        {
+        if result.as_ref().is_err_and(should_reconcile_after_error) {
             self.reconciled
                 .store(false, std::sync::atomic::Ordering::Release);
         }
@@ -1095,7 +1091,10 @@ impl RouteEventStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let temporary_path = self.events_dir().join(format!(".{sequence:020}.tmp"));
+        // A crash can leave an unpublished temp while the next append reuses this sequence.
+        let temporary_path = self
+            .events_dir()
+            .join(format!(".{sequence:020}.{}.tmp", uuid::Uuid::new_v4()));
         write_private_file(&temporary_path, &line)?;
         fs::rename(&temporary_path, &final_path)?;
         sync_directory(&self.events_dir())?;
@@ -1582,26 +1581,25 @@ fn ensure_settings_dir(path: &Path) -> std::io::Result<()> {
                 if metadata.file_type().is_dir()
                     && metadata.uid() == unsafe { libc::geteuid() } =>
             {
-                return Ok(());
+                Ok(())
             }
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "managed route settings path is not an owned directory",
-                ));
-            }
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed route settings path is not an owned directory",
+            )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir_all(path)?;
                 let metadata = fs::symlink_metadata(path)?;
                 if metadata.file_type().is_dir() && metadata.uid() == unsafe { libc::geteuid() } {
-                    return Ok(());
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "managed route settings path is not an owned directory",
+                    ))
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "managed route settings path is not an owned directory",
-                ));
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
     }
     #[cfg(not(unix))]
@@ -2506,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_event_temp_remains_reserved_and_is_never_deleted() {
+    fn legacy_event_temp_remains_reserved_without_blocking_global_sequence_reuse() {
         let dir = tempdir().unwrap();
         let store = RouteEventStore::new(dir.path());
         let call = ManagedRouteCall::new(
@@ -2517,21 +2515,53 @@ mod tests {
         );
         let observer = ManagedHopObserver::new(call);
         observer.start("provider", Some("model")).unwrap();
+
+        // A process can die after private temp creation but before publishing the
+        // global sequence file. Preserve the legacy fixed name, but do not reuse it
+        // for another correlation's next global event.
         let temp_path = store.events_dir().join(".00000000000000000002.tmp");
         write_private_file(&temp_path, b"partial temp data").unwrap();
 
-        assert!(observer.record_headers(200).is_err());
-        assert!(observer.terminal_persistence_failed());
-        assert_eq!(observer.observed_status_code(), None);
+        let unrelated_call = ManagedRouteCall::new(
+            Arc::new(RouteEventStore::new(dir.path())),
+            "attempt-unrelated".into(),
+            "call-1".into(),
+            "model".into(),
+        );
+        let unrelated_observer = ManagedHopObserver::new(unrelated_call);
+        unrelated_observer
+            .start("provider-unrelated", Some("model"))
+            .unwrap();
+        unrelated_observer.record_headers(201).unwrap();
+        unrelated_observer
+            .finish(
+                &unrelated_observer.started_event().unwrap(),
+                Some("model".into()),
+                Some(201),
+                "upstream_body_complete",
+            )
+            .unwrap();
+
+        observer.record_headers(200).unwrap();
+        observer
+            .finish(
+                &observer.started_event().unwrap(),
+                Some("model".into()),
+                Some(200),
+                "upstream_body_complete",
+            )
+            .unwrap();
         assert!(temp_path.exists());
         let page = store.read_page("attempt-temp", 0, None, 10).unwrap();
-        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events.len(), 3);
         assert_eq!(page.events[0].event_type, RouteEventType::HopStarted);
+        assert_eq!(page.events[1].event_type, RouteEventType::HopHeaders);
+        assert_eq!(page.events[2].event_type, RouteEventType::HopFinished);
         let seal = futures::executor::block_on(
             store.seal("attempt-temp", std::time::Duration::from_millis(1)),
         )
         .unwrap();
-        assert!(!seal.sealed);
-        assert_eq!(seal.pending_hops, 1);
+        assert!(seal.sealed);
+        assert_eq!(seal.pending_hops, 0);
     }
 }
