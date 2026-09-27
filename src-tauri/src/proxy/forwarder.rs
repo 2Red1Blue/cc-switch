@@ -4791,7 +4791,7 @@ mod tests {
         let store = std::sync::Arc::new(super::super::managed_route_events::RouteEventStore::new(
             directory.path(),
         ));
-        let _call_lease = store
+        let call_lease = store
             .register_call("attempt-header-receipt-failure")
             .unwrap();
         let conflicting_event = directory
@@ -4822,7 +4822,7 @@ mod tests {
         let call = super::super::managed_route_events::ManagedRouteCall::new(
             store.clone(),
             "attempt-header-receipt-failure".into(),
-            "call-1".into(),
+            call_lease.call_id().to_string(),
             "claude-sonnet".into(),
         );
         let mut extensions = http::Extensions::new();
@@ -4933,7 +4933,7 @@ mod tests {
         let call = super::super::managed_route_events::ManagedRouteCall::new(
             store.clone(),
             correlation_id.into(),
-            "call-1".into(),
+            call_lease.call_id().to_string(),
             "claude-sonnet".into(),
         );
         let mut extensions = http::Extensions::new();

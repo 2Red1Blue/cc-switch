@@ -65,6 +65,9 @@ struct CallActivityState {
 /// Keeps an admitted Claude call active until its final response body ends or is dropped.
 pub struct ManagedCallLease {
     activity: Arc<CallActivity>,
+    settings_dir: PathBuf,
+    correlation_id: String,
+    call_id: String,
 }
 
 impl Drop for ManagedCallLease {
@@ -72,9 +75,52 @@ impl Drop for ManagedCallLease {
         let Ok(mut state) = self.activity.state.lock() else {
             return;
         };
+        if let Err(error) =
+            release_durable_call_lease(&self.settings_dir, &self.correlation_id, &self.call_id)
+        {
+            log::error!("[RouteReceipt] failed to release admitted call lease: {error}");
+        }
         state.active_calls = state.active_calls.saturating_sub(1);
         self.activity.active_watch.send_replace(state.active_calls);
     }
+}
+
+impl ManagedCallLease {
+    /// Returns the call ID admitted by this lease.
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+}
+
+fn release_durable_call_lease(
+    settings_dir: &Path,
+    correlation_id: &str,
+    call_id: &str,
+) -> std::io::Result<()> {
+    ensure_settings_dir(settings_dir)?;
+    let events_dir = settings_dir.join("managed-route-events");
+    ensure_private_events_dir(&events_dir)?;
+    let lock_path = settings_dir.join("managed-route-events.lock");
+    let _process_lock = acquire_file_lock(&lock_path)?;
+    let seal_path = events_dir.join(format!("corr-{correlation_id}.seal.json"));
+    let mut seal = read_seal_state(&seal_path, correlation_id)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed route admission lease lost its durable seal state",
+        )
+    })?;
+    let position = seal
+        .active_call_ids
+        .iter()
+        .position(|active_call_id| active_call_id == call_id)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed route admission lease was already released",
+            )
+        })?;
+    seal.active_call_ids.remove(position);
+    write_seal_state(&seal_path, &seal)
 }
 
 /// Per-outbound-call observer shared by the forwarding wrapper and send seam.
@@ -332,6 +378,9 @@ struct DurableSealState {
     schema_version: u8,
     correlation_id: String,
     ingress_closed: bool,
+    /// Request call IDs admitted before ingress closed and not yet released.
+    #[serde(default)]
+    active_call_ids: Vec<String>,
     pending_hops: u64,
     #[serde(default)]
     event_count: u64,
@@ -375,6 +424,7 @@ pub struct RouteSealResponse {
     /// scan truncation, or `hop_started` lacking a matching `hop_finished`.
     pub sealed: bool,
     pub ingress_closed: bool,
+    /// Number of admitted request call IDs whose leases have not been released.
     pub active_calls: u64,
     pub pending_hops: u64,
     pub event_count: u64,
@@ -808,6 +858,7 @@ impl RouteEventStore {
         validate_correlation_id(correlation_id).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid correlation id")
         })?;
+        let call_id = uuid::Uuid::new_v4().to_string();
         let activity = self.activity_for(correlation_id)?;
         let mut state = activity
             .state
@@ -822,8 +873,24 @@ impl RouteEventStore {
         ensure_private_events_dir(&self.events_dir())?;
         self.ensure_reconciled_locked()?;
         let path = self.seal_path(correlation_id);
-        let mut durable = read_seal_state(&path, correlation_id)?;
-        if durable.as_ref().is_some_and(|seal| seal.ingress_closed) {
+        let mut durable = match read_seal_state(&path, correlation_id)? {
+            Some(durable) => durable,
+            None => {
+                self.reserve_storage_locked(PER_CORRELATION_RESERVATION_BYTES)?;
+                DurableSealState {
+                    schema_version: 1,
+                    correlation_id: correlation_id.to_string(),
+                    ingress_closed: false,
+                    active_call_ids: Vec::new(),
+                    pending_hops: 0,
+                    event_count: 0,
+                    reserved_hops: 0,
+                    metadata_reserved: true,
+                    high_watermark: None,
+                }
+            }
+        };
+        if durable.ingress_closed {
             state.ingress_closed = true;
             state.seal_checked = true;
             return Err(std::io::Error::new(
@@ -831,38 +898,29 @@ impl RouteEventStore {
                 "Fabric correlation has been sealed; new calls are rejected",
             ));
         }
-        if durable.as_ref().is_some_and(|seal| seal.pending_hops > 0) && state.active_calls == 0 {
+        if state.active_calls == 0
+            && (!durable.active_call_ids.is_empty() || durable.pending_hops > 0)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "Fabric correlation has unresolved route evidence; new calls are rejected",
+                "Fabric correlation has unresolved admitted calls or route evidence; new calls are rejected",
             ));
         }
-        if durable.is_none() {
+        if !durable.metadata_reserved {
             self.reserve_storage_locked(PER_CORRELATION_RESERVATION_BYTES)?;
-            let initial = DurableSealState {
-                schema_version: 1,
-                correlation_id: correlation_id.to_string(),
-                ingress_closed: false,
-                pending_hops: 0,
-                event_count: 0,
-                reserved_hops: 0,
-                metadata_reserved: true,
-                high_watermark: None,
-            };
-            write_seal_state(&path, &initial)?;
-        } else if durable.as_ref().is_some_and(|seal| !seal.metadata_reserved) {
-            self.reserve_storage_locked(PER_CORRELATION_RESERVATION_BYTES)?;
-            if let Some(seal) = durable.as_mut() {
-                seal.metadata_reserved = true;
-                write_seal_state(&path, seal)?;
-            }
+            durable.metadata_reserved = true;
         }
         self.remember_current_locked()?;
+        durable.active_call_ids.push(call_id.clone());
+        write_seal_state(&path, &durable)?;
         state.seal_checked = true;
         state.active_calls = state.active_calls.saturating_add(1);
         activity.active_watch.send_replace(state.active_calls);
         Ok(ManagedCallLease {
             activity: activity.clone(),
+            settings_dir: self.settings_dir.clone(),
+            correlation_id: correlation_id.to_string(),
+            call_id,
         })
     }
 
@@ -907,15 +965,20 @@ impl RouteEventStore {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut active_rx = activity.active_watch.subscribe();
         loop {
-            let active_calls = *active_rx.borrow_and_update();
+            let active_calls = self.durable_active_lease_count(correlation_id)?;
             if active_calls == 0 {
                 break;
             }
-            if tokio::time::timeout_at(deadline, active_rx.changed())
-                .await
-                .is_err()
+            if tokio::time::timeout_at(deadline, async {
+                tokio::select! {
+                    _ = active_rx.changed() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {},
+                }
+            })
+            .await
+            .is_err()
             {
-                return self.seal_response(correlation_id, false, active_calls, true, None);
+                return self.seal_response(correlation_id, false, true, None);
             }
         }
 
@@ -932,10 +995,13 @@ impl RouteEventStore {
                 "durable seal state disappeared",
             )
         })?;
-        if durable.pending_hops != 0 || durable.reserved_hops != 0 {
+        if !durable.active_call_ids.is_empty()
+            || durable.pending_hops != 0
+            || durable.reserved_hops != 0
+        {
             drop(_process_lock);
             drop(_local);
-            return self.seal_response(correlation_id, false, 0, false, None);
+            return self.seal_response(correlation_id, false, false, None);
         }
         let high_watermark = self.latest_sequence_locked()?;
         durable.high_watermark = Some(durable.high_watermark.unwrap_or(high_watermark));
@@ -959,7 +1025,6 @@ impl RouteEventStore {
         &self,
         correlation_id: &str,
         sealed: bool,
-        active_calls: u64,
         timed_out: bool,
         high_watermark: Option<u64>,
     ) -> std::io::Result<RouteSealResponse> {
@@ -967,6 +1032,9 @@ impl RouteEventStore {
         ensure_private_events_dir(&self.events_dir())?;
         self.force_reconcile_locked()?;
         let durable = read_seal_state(&self.seal_path(correlation_id), correlation_id)?;
+        let active_calls = durable
+            .as_ref()
+            .map_or(0, |state| state.active_call_ids.len() as u64);
         let pending_hops = durable.as_ref().map_or(0, |state| state.pending_hops);
         let event_count = durable.as_ref().map_or(0, |state| state.event_count);
         Ok(RouteSealResponse {
@@ -981,6 +1049,23 @@ impl RouteEventStore {
             high_watermark,
             timed_out,
         })
+    }
+
+    fn durable_active_lease_count(&self, correlation_id: &str) -> std::io::Result<u64> {
+        let _local = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("route event writer lock poisoned"))?;
+        let _process_lock = acquire_file_lock(&self.lock_path())?;
+        ensure_private_events_dir(&self.events_dir())?;
+        let durable = read_seal_state(&self.seal_path(correlation_id), correlation_id)?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Fabric correlation was never admitted",
+                )
+            })?;
+        Ok(durable.active_call_ids.len() as u64)
     }
 
     fn latest_sequence_locked(&self) -> std::io::Result<u64> {
@@ -1030,6 +1115,7 @@ impl RouteEventStore {
                     schema_version: 1,
                     correlation_id: event.correlation_id.clone(),
                     ingress_closed: false,
+                    active_call_ids: Vec::new(),
                     pending_hops: 0,
                     event_count: 0,
                     reserved_hops: 0,
@@ -1044,6 +1130,17 @@ impl RouteEventStore {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "managed route correlation is sealed; late events are rejected",
+            ));
+        }
+        if seal_state.ingress_closed
+            && !seal_state
+                .active_call_ids
+                .iter()
+                .any(|call_id| call_id == &event.call_id)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed route call was not admitted before ingress closed",
             ));
         }
         let is_hop_started = event.event_type == RouteEventType::HopStarted;
@@ -1984,7 +2081,7 @@ mod tests {
         let call = ManagedRouteCall::new(
             store.clone(),
             "attempt-seal".into(),
-            "call-1".into(),
+            lease.call_id().to_string(),
             "model".into(),
         );
         let observer = ManagedHopObserver::new(call);
@@ -2209,28 +2306,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_store_cannot_seal_before_a_late_admitted_call_starts_its_hop() {
+    async fn second_store_waits_for_an_admitted_call_before_sealing() {
         let dir = tempdir().unwrap();
-        let original = RouteEventStore::new(dir.path());
+        let original = Arc::new(RouteEventStore::new(dir.path()));
         let lease = original.register_call("attempt-handover").unwrap();
         let replacement = RouteEventStore::new(dir.path());
-        let seal = replacement
-            .seal("attempt-handover", std::time::Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert!(seal.sealed);
-        assert_eq!(seal.high_watermark, Some(0));
+        let seal_path = original.seal_path("attempt-handover");
+        let seal_task = tokio::spawn(async move {
+            replacement
+                .seal("attempt-handover", std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+        });
+        let durable = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let durable = read_seal_state(&seal_path, "attempt-handover")
+                    .unwrap()
+                    .unwrap();
+                if durable.ingress_closed {
+                    break durable;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement store closes ingress");
+        assert_eq!(durable.active_call_ids, vec![lease.call_id().to_string()]);
+        assert!(RouteEventStore::new(dir.path())
+            .register_call("attempt-handover")
+            .is_err());
+        let unadmitted = ManagedHopObserver::new(ManagedRouteCall::new(
+            original.clone(),
+            "attempt-handover".into(),
+            "unadmitted-call".into(),
+            "model".into(),
+        ));
+        assert!(unadmitted.start("provider", Some("model")).is_err());
 
         let call = ManagedRouteCall::new(
-            Arc::new(original),
+            original.clone(),
             "attempt-handover".into(),
-            "call-1".into(),
+            lease.call_id().to_string(),
             "model".into(),
         );
         let observer = ManagedHopObserver::new(call);
-        assert!(observer.start("provider", Some("model")).is_err());
-        assert!(observer.started_event().is_none());
+        observer.start("provider", Some("model")).unwrap();
+        observer.record_headers(200).unwrap();
+        observer
+            .finish(
+                &observer.started_event().unwrap(),
+                Some("model".into()),
+                Some(200),
+                "upstream_body_complete",
+            )
+            .unwrap();
         drop(lease);
+
+        let seal = seal_task.await.unwrap();
+        assert!(seal.sealed);
+        assert_eq!(seal.active_calls, 0);
+        assert_eq!(seal.pending_hops, 0);
+        assert_eq!(seal.event_count, 3);
+        assert_eq!(seal.high_watermark, Some(3));
+    }
+
+    #[tokio::test]
+    async fn replacement_store_never_seals_an_unreleased_call_lease() {
+        let dir = tempdir().unwrap();
+        let original = RouteEventStore::new(dir.path());
+        let lease = original.register_call("attempt-crashed-call").unwrap();
+        std::mem::forget(lease);
+
+        let replacement = RouteEventStore::new(dir.path());
+        let seal = replacement
+            .seal("attempt-crashed-call", std::time::Duration::from_millis(5))
+            .await
+            .unwrap();
+        assert!(!seal.sealed);
+        assert!(seal.timed_out);
+        assert_eq!(seal.active_calls, 1);
+        assert_eq!(seal.high_watermark, None);
     }
 
     #[tokio::test]
@@ -2269,7 +2424,7 @@ mod tests {
         let call = ManagedRouteCall::new(
             store.clone(),
             "attempt-gap-after-seal".into(),
-            "call-1".into(),
+            lease.call_id().to_string(),
             "model".into(),
         );
         let observer = ManagedHopObserver::new(call);
@@ -2328,6 +2483,7 @@ mod tests {
                 schema_version: 1,
                 correlation_id: "attempt-omission".to_string(),
                 ingress_closed: true,
+                active_call_ids: Vec::new(),
                 pending_hops: 0,
                 event_count: 3,
                 reserved_hops: 0,

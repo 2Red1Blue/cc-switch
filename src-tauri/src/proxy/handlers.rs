@@ -231,10 +231,16 @@ async fn handle_messages_for_app(
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     if let Some(correlation_id) = managed_correlation_id.as_deref() {
+        let call_id = managed_call_lease
+            .as_ref()
+            .map(|lease| lease.call_id().to_string())
+            .ok_or_else(|| {
+                ProxyError::Internal("managed route call lease is missing".to_string())
+            })?;
         extensions.insert(super::managed_route_events::ManagedRouteCall::new(
             state.route_events.clone(),
             correlation_id.to_string(),
-            uuid::Uuid::new_v4().to_string(),
+            call_id,
             body.get("model")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
