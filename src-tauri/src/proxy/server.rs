@@ -832,31 +832,85 @@ mod tests {
         response.bytes().await.unwrap();
         assert!(*upstream_seen.lock().await);
 
-        let seal = control_json(
-            &socket_path,
-            "POST",
-            &format!("/managed/v1/route-events/seal?correlationId={attempt}&timeoutMs=1000"),
-        )
-        .await;
-        assert_eq!(seal["sealed"], true);
-        assert_eq!(seal["pendingHops"], 0);
-        assert_eq!(seal["eventCount"], 3);
-        let watermark = seal["highWatermark"].as_u64().unwrap();
-        let page = control_json(&socket_path, "GET", &format!("/managed/v1/route-events?correlationId={attempt}&after=0&through={watermark}&limit=10")).await;
-        assert_eq!(page["eventCount"], 3);
-        assert_eq!(page["cursorGap"], false);
-        assert_eq!(page["events"][0]["eventType"], "hop_started");
-        assert_eq!(page["events"][1]["eventType"], "hop_headers");
-        assert_eq!(page["events"][2]["eventType"], "hop_finished");
-        assert_eq!(page["events"][2]["providerId"], "isolated-provider");
-        assert_eq!(page["events"][2]["statusCode"], 200);
-        proxy.stop().await.unwrap();
+        let qualification = if let Some(script_path) =
+            std::env::var_os("AGENT_FABRIC_ROUTE_QUAL_SCRIPT")
+        {
+            let socket_path = socket_path.clone();
+            let port = proxy_info.port.to_string();
+            Some(if std::path::Path::new(&script_path).is_absolute() {
+                tokio::task::spawn_blocking(move || {
+                    let mut child = std::process::Command::new("node")
+                        .arg(script_path)
+                        .arg(socket_path)
+                        .arg(attempt)
+                        .arg(port)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map_err(|_| "spawn_failed")?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => break Ok(status.success()),
+                            Ok(None) if std::time::Instant::now() >= deadline => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break Err("timed_out");
+                            }
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                            Err(_) => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break Err("wait_failed");
+                            }
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "task_failed")
+                .and_then(|result| result)
+            } else {
+                Err("script_path_not_absolute")
+            })
+        } else {
+            let seal = control_json(
+                &socket_path,
+                "POST",
+                &format!("/managed/v1/route-events/seal?correlationId={attempt}&timeoutMs=1000"),
+            )
+            .await;
+            assert_eq!(seal["sealed"], true);
+            assert_eq!(seal["pendingHops"], 0);
+            assert_eq!(seal["eventCount"], 3);
+            let watermark = seal["highWatermark"].as_u64().unwrap();
+            let page = control_json(&socket_path, "GET", &format!("/managed/v1/route-events?correlationId={attempt}&after=0&through={watermark}&limit=10")).await;
+            assert_eq!(page["eventCount"], 3);
+            assert_eq!(page["cursorGap"], false);
+            assert_eq!(page["events"][0]["eventType"], "hop_started");
+            assert_eq!(page["events"][1]["eventType"], "hop_headers");
+            assert_eq!(page["events"][2]["eventType"], "hop_finished");
+            assert_eq!(page["events"][2]["providerId"], "isolated-provider");
+            assert_eq!(page["events"][2]["statusCode"], 200);
+            None
+        };
+        let stop_result = proxy.stop().await;
         upstream_task.abort();
-        assert!(!socket_path.exists());
+        let socket_removed = !socket_path.exists();
         if let Some(previous) = previous_test_home {
             std::env::set_var("CC_SWITCH_TEST_HOME", previous);
         } else {
             std::env::remove_var("CC_SWITCH_TEST_HOME");
+        }
+        stop_result.unwrap();
+        assert!(socket_removed);
+        if let Some(qualification) = qualification {
+            let exited_zero = qualification
+                .unwrap_or_else(|reason| panic!("Fabric wire qualification failed: {reason}"));
+            assert!(
+                exited_zero,
+                "Fabric wire qualification failed: nonzero_exit"
+            );
+            println!("Fabric wire qualification: passed");
         }
     }
 
