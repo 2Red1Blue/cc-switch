@@ -741,6 +741,218 @@ mod tests {
         assert!(!available.load(std::sync::atomic::Ordering::Acquire));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[serial]
+    async fn managed_claude_request_exposes_complete_route_over_private_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn control_json(path: &std::path::Path, method: &str, uri: &str) -> Value {
+            let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+            stream
+                .write_all(
+                    format!("{method} {uri} HTTP/1.1\r\nHost: local\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+        }
+
+        let home = tempfile::Builder::new()
+            .prefix("ccsr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let previous_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+        std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+        std::fs::create_dir(crate::config::get_app_config_dir()).unwrap();
+        let upstream_seen = Arc::new(Mutex::new(false));
+        let seen = upstream_seen.clone();
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    assert!(!headers.contains_key("x-fabric-managed-attempt-id"));
+                    *seen.lock().await = true;
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"id":"msg_test","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+                    )
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream).await.unwrap();
+        });
+
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "isolated-provider".to_string(),
+            "Isolated Provider".to_string(),
+            json!({"env": {"ANTHROPIC_BASE_URL": format!("http://{upstream_addr}"), "ANTHROPIC_AUTH_TOKEN": "test-token"}}),
+            None,
+        );
+        db.save_provider("claude", &provider).unwrap();
+        db.set_current_provider("claude", &provider.id).unwrap();
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..ProxyConfig::default()
+            },
+            db,
+            None,
+        );
+        let proxy_info = proxy.start().await.unwrap();
+        let socket_path = control_socket_path(&crate::config::get_app_config_dir());
+        let info = control_json(&socket_path, "GET", "/managed/v1/info").await;
+        assert_eq!(
+            info,
+            json!({"schemaVersion": 1, "producerSchemaGeneration": 1, "proxyPort": proxy_info.port, "loopbackReachable": true})
+        );
+
+        let attempt = "isolated-attempt-1";
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}/v1/messages", proxy_info.port))
+            .header("x-fabric-managed-attempt-id", attempt)
+            .json(&json!({"model": "claude-test", "max_tokens": 16, "messages": [{"role": "user", "content": "hello"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert!(*upstream_seen.lock().await);
+
+        let seal = control_json(
+            &socket_path,
+            "POST",
+            &format!("/managed/v1/route-events/seal?correlationId={attempt}&timeoutMs=1000"),
+        )
+        .await;
+        assert_eq!(seal["sealed"], true);
+        assert_eq!(seal["pendingHops"], 0);
+        assert_eq!(seal["eventCount"], 3);
+        let watermark = seal["highWatermark"].as_u64().unwrap();
+        let page = control_json(&socket_path, "GET", &format!("/managed/v1/route-events?correlationId={attempt}&after=0&through={watermark}&limit=10")).await;
+        assert_eq!(page["eventCount"], 3);
+        assert_eq!(page["cursorGap"], false);
+        assert_eq!(page["events"][0]["eventType"], "hop_started");
+        assert_eq!(page["events"][1]["eventType"], "hop_headers");
+        assert_eq!(page["events"][2]["eventType"], "hop_finished");
+        assert_eq!(page["events"][2]["providerId"], "isolated-provider");
+        assert_eq!(page["events"][2]["statusCode"], 200);
+        proxy.stop().await.unwrap();
+        upstream_task.abort();
+        assert!(!socket_path.exists());
+        if let Some(previous) = previous_test_home {
+            std::env::set_var("CC_SWITCH_TEST_HOME", previous);
+        } else {
+            std::env::remove_var("CC_SWITCH_TEST_HOME");
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[serial]
+    #[ignore = "manual qualification against the current provider"]
+    async fn serve_current_claude_provider_with_isolated_proxy() {
+        use rusqlite::OpenFlags;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let source_db_path = std::env::var_os("CC_SWITCH_QUAL_SOURCE_DB")
+            .expect("CC_SWITCH_QUAL_SOURCE_DB is required");
+        let source =
+            rusqlite::Connection::open_with_flags(source_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        source.execute_batch("PRAGMA query_only = ON;").unwrap();
+        let (provider_id, provider_name, raw_config, raw_meta): (String, String, String, String) = source
+            .query_row(
+                "SELECT id, name, settings_config, meta FROM providers WHERE app_type = 'claude' AND is_current = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        drop(source);
+        let settings_config: Value = serde_json::from_str(&raw_config).unwrap();
+        let meta: ProviderMeta = serde_json::from_str(&raw_meta).unwrap();
+        let mut provider =
+            Provider::with_id(provider_id.clone(), provider_name, settings_config, None);
+        provider.meta = Some(meta);
+        let home = tempfile::Builder::new()
+            .prefix("ccsr-real-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let previous_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+        std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+        let config_dir = crate::config::get_app_config_dir();
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::set_permissions(
+            &config_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("claude", &provider).unwrap();
+        db.set_current_provider("claude", &provider_id).unwrap();
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                enable_logging: false,
+                ..ProxyConfig::default()
+            },
+            db,
+            None,
+        );
+        let info = proxy.start().await.unwrap();
+        let socket_path = control_socket_path(&config_dir);
+        assert!(socket_path.exists());
+        println!("QUAL_PORT={}", info.port);
+        println!("QUAL_SOCKET={}", socket_path.display());
+        if std::env::var_os("CC_SWITCH_QUAL_SELF_REQUEST").is_some() {
+            let model = provider.settings_config["env"]["ANTHROPIC_MODEL"]
+                .as_str()
+                .or_else(|| {
+                    provider.settings_config["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"].as_str()
+                })
+                .expect("current provider has no model");
+            let response = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap()
+                .post(format!("http://127.0.0.1:{}/v1/messages", info.port))
+                .header("x-fabric-managed-attempt-id", "isolated-real-attempt-1")
+                .json(&json!({"model": model, "max_tokens": 16, "messages": [{"role": "user", "content": "Reply exactly: route qualified"}]}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            response.bytes().await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+        }
+        let hold_secs = std::env::var("CC_SWITCH_QUAL_HOLD_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(40)
+            .min(600);
+        tokio::time::sleep(std::time::Duration::from_secs(hold_secs)).await;
+        proxy.stop().await.unwrap();
+        if let Some(previous) = previous_test_home {
+            std::env::set_var("CC_SWITCH_TEST_HOME", previous);
+        } else {
+            std::env::remove_var("CC_SWITCH_TEST_HOME");
+        }
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         path_and_query: String,
