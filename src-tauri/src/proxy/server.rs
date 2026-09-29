@@ -498,6 +498,10 @@ impl ProxyServer {
                 get(handlers::handle_managed_route_events),
             )
             .route(
+                "/managed/v1/route-events/receipt",
+                get(handlers::handle_managed_route_receipt),
+            )
+            .route(
                 "/managed/v1/route-events/seal",
                 post(handlers::handle_managed_route_seal),
             )
@@ -739,6 +743,291 @@ mod tests {
         handle.await.unwrap();
         assert!(!path.exists());
         assert!(!available.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[serial]
+    async fn sealed_receipt_control_route_uses_read_only_get_statuses() {
+        use super::super::managed_route_events::RouteEvent;
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn request(path: &std::path::Path, method: &str, uri: &str) -> String {
+            let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+            stream
+                .write_all(
+                    format!("{method} {uri} HTTP/1.1\r\nHost: local\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        }
+
+        fn durable_snapshot(
+            settings: &std::path::Path,
+        ) -> Vec<(PathBuf, Option<Vec<u8>>, u32, std::time::SystemTime)> {
+            fn visit(
+                settings: &std::path::Path,
+                path: &std::path::Path,
+                entries: &mut Vec<(PathBuf, Option<Vec<u8>>, u32, std::time::SystemTime)>,
+            ) {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    let entry_path = entry.path();
+                    if entry_path == settings.join("managed-route-control") {
+                        continue;
+                    }
+                    let metadata = std::fs::symlink_metadata(&entry_path).unwrap();
+                    let bytes = metadata
+                        .is_file()
+                        .then(|| std::fs::read(&entry_path).unwrap());
+                    entries.push((
+                        entry_path.strip_prefix(settings).unwrap().to_path_buf(),
+                        bytes,
+                        metadata.permissions().mode(),
+                        metadata.modified().unwrap(),
+                    ));
+                    if metadata.is_dir() {
+                        visit(settings, &entry_path, entries);
+                    }
+                }
+            }
+            let mut entries = Vec::new();
+            let root_metadata = std::fs::symlink_metadata(settings).unwrap();
+            entries.push((
+                PathBuf::from("."),
+                None,
+                root_metadata.permissions().mode(),
+                root_metadata.modified().unwrap(),
+            ));
+            visit(settings, settings, &mut entries);
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries
+        }
+
+        let home = tempfile::Builder::new()
+            .prefix("ccsr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let previous_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+        std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+        let settings = crate::config::get_app_config_dir();
+        std::fs::create_dir_all(&settings).unwrap();
+        let proxy = ProxyServer::new(
+            ProxyConfig::default(),
+            Arc::new(Database::memory().unwrap()),
+            None,
+        );
+        let store = proxy.state.route_events.clone();
+        let path = control_socket_path(&settings);
+        let listener = bind_route_control_socket(&path).await.unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_path = path.clone();
+        let handle = tokio::spawn(serve_route_control_socket(
+            listener,
+            proxy.build_route_control_router(),
+            server_path,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            shutdown_rx,
+        ));
+
+        let unknown = request(
+            &path,
+            "GET",
+            "/managed/v1/route-events/receipt?correlationId=attempt-wire",
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        assert!(unknown
+            .to_ascii_lowercase()
+            .contains("content-type: application/json"));
+        let unknown_body: Value =
+            serde_json::from_str(unknown.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            unknown_body,
+            json!({
+                "schemaVersion": 1,
+                "producerSchemaGeneration": 1,
+                "correlationId": "attempt-wire",
+                "error": "receipt_missing"
+            })
+        );
+        let unsupported = request(
+            &path,
+            "GET",
+            "/managed/v1/route-events/receipt-unsupported?correlationId=attempt-wire",
+        )
+        .await;
+        assert!(unsupported.starts_with("HTTP/1.1 404"), "{unsupported}");
+        assert!(!unsupported.contains("receipt_missing"));
+        assert!(!settings.join("managed-route-events").exists());
+        let lease = store.register_call("attempt-wire").unwrap();
+        let open = request(
+            &path,
+            "GET",
+            "/managed/v1/route-events/receipt?correlationId=attempt-wire",
+        )
+        .await;
+        assert!(open.starts_with("HTTP/1.1 409"), "{open}");
+        assert!(open
+            .to_ascii_lowercase()
+            .contains("content-type: application/json"));
+        let open_body: Value =
+            serde_json::from_str(open.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            open_body,
+            json!({
+                "schemaVersion": 1,
+                "producerSchemaGeneration": 1,
+                "correlationId": "attempt-wire",
+                "error": "receipt_unsealed"
+            })
+        );
+        let no_post = request(
+            &path,
+            "POST",
+            "/managed/v1/route-events/receipt?correlationId=attempt-wire",
+        )
+        .await;
+        assert!(no_post.starts_with("HTTP/1.1 405"), "{no_post}");
+        let next = store.register_call("attempt-wire").unwrap();
+        drop(next);
+        drop(lease);
+        let seal = store
+            .seal("attempt-wire", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(seal.sealed);
+        let sealed = request(
+            &path,
+            "GET",
+            "/managed/v1/route-events/receipt?correlationId=attempt-wire&after=0&through=999&limit=2",
+        )
+        .await;
+        assert!(sealed.starts_with("HTTP/1.1 200"), "{sealed}");
+        let body: Value = serde_json::from_str(sealed.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["state"], "sealed");
+        assert_eq!(body["highWatermark"], 0);
+        assert_eq!(body["eventCount"], 0);
+        assert!(body.get("timedOut").is_none());
+
+        let lease = store.register_call("attempt-page").unwrap();
+        let started = RouteEvent::started(
+            "attempt-page",
+            lease.call_id(),
+            1,
+            "hop-page",
+            "provider-page",
+            "model-page",
+        );
+        let finished = RouteEvent::finished_from(
+            &started,
+            Some("upstream-page".into()),
+            Some(200),
+            "upstream_body_complete",
+        );
+        store.append(started.clone()).unwrap();
+        store.append(finished.clone()).unwrap();
+        drop(lease);
+        let page_seal = store
+            .seal("attempt-page", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(page_seal.sealed);
+        assert_eq!(page_seal.event_count, 2);
+        assert_eq!(page_seal.high_watermark, Some(2));
+        store
+            .append(RouteEvent::started(
+                "later-correlation",
+                "later-call",
+                1,
+                "later-hop",
+                "later-provider",
+                "later-model",
+            ))
+            .unwrap();
+        let before_get = durable_snapshot(&settings);
+
+        let first_response = request(
+            &path,
+            "GET",
+            "/managed/v1/route-events/receipt?correlationId=attempt-page&after=0&through=999&limit=1",
+        )
+        .await;
+        assert!(
+            first_response.starts_with("HTTP/1.1 200"),
+            "{first_response}"
+        );
+        let first_page: Value =
+            serde_json::from_str(first_response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let mut expected_started = started;
+        expected_started.sequence = 1;
+        expected_started.correlation_sequence = 1;
+        assert_eq!(
+            first_page,
+            json!({
+                "schemaVersion": 1,
+                "producerSchemaGeneration": 1,
+                "state": "sealed",
+                "correlationId": "attempt-page",
+                "events": [serde_json::to_value(expected_started).unwrap()],
+                "eventCount": 2,
+                "nextAfter": 1,
+                "latestSequence": 3,
+                "highWatermark": 2,
+                "cursorAhead": false,
+                "hasMore": true,
+                "cursorGap": false,
+                "scanTruncated": false
+            })
+        );
+
+        let second_response = request(
+            &path,
+            "GET",
+            "/managed/v1/route-events/receipt?correlationId=attempt-page&after=1&limit=1",
+        )
+        .await;
+        assert!(
+            second_response.starts_with("HTTP/1.1 200"),
+            "{second_response}"
+        );
+        let second_page: Value =
+            serde_json::from_str(second_response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let mut expected_finished = finished;
+        expected_finished.sequence = 2;
+        expected_finished.correlation_sequence = 2;
+        assert_eq!(
+            second_page,
+            json!({
+                "schemaVersion": 1,
+                "producerSchemaGeneration": 1,
+                "state": "sealed",
+                "correlationId": "attempt-page",
+                "events": [serde_json::to_value(expected_finished).unwrap()],
+                "eventCount": 2,
+                "nextAfter": 2,
+                "latestSequence": 3,
+                "highWatermark": 2,
+                "cursorAhead": false,
+                "hasMore": false,
+                "cursorGap": false,
+                "scanTruncated": false
+            })
+        );
+        assert_eq!(durable_snapshot(&settings), before_get);
+
+        shutdown_tx.send(()).unwrap();
+        handle.await.unwrap();
+        if let Some(previous) = previous_test_home {
+            std::env::set_var("CC_SWITCH_TEST_HOME", previous);
+        } else {
+            std::env::remove_var("CC_SWITCH_TEST_HOME");
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

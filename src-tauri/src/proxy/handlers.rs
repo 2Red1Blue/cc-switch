@@ -393,6 +393,46 @@ pub async fn handle_managed_route_events(
     Ok(Json(page))
 }
 
+/// Reads only evidence under an existing complete durable seal.
+pub async fn handle_managed_route_receipt(
+    State(state): State<ProxyState>,
+    Query(query): Query<super::managed_route_events::RouteReceiptQuery>,
+) -> axum::response::Response {
+    use super::managed_route_events::{
+        RouteReceiptErrorCode, RouteReceiptErrorResponse, RouteReceiptReadError,
+    };
+    let result =
+        state
+            .route_events
+            .read_sealed_receipt(&query.correlation_id, query.after, query.limit);
+    let (status, code) = match result {
+        Ok(page) => return Json(page).into_response(),
+        Err(RouteReceiptReadError::NotFound) => {
+            (StatusCode::NOT_FOUND, RouteReceiptErrorCode::ReceiptMissing)
+        }
+        Err(RouteReceiptReadError::Incomplete) => {
+            (StatusCode::CONFLICT, RouteReceiptErrorCode::ReceiptUnsealed)
+        }
+        Err(RouteReceiptReadError::Io(error)) => {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            log::error!("[RouteReceipt] read-only receipt query failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    (
+        status,
+        Json(RouteReceiptErrorResponse {
+            schema_version: 1,
+            producer_schema_generation: 1,
+            correlation_id: query.correlation_id,
+            error: code,
+        }),
+    )
+        .into_response()
+}
+
 /// Durably closes one Fabric correlation and waits for admitted calls to quiesce.
 pub async fn handle_managed_route_seal(
     State(state): State<ProxyState>,

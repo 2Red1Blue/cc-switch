@@ -341,6 +341,16 @@ pub struct RouteEventsQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RouteReceiptQuery {
+    pub correlation_id: String,
+    #[serde(default)]
+    pub after: u64,
+    #[serde(default = "default_page_size")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RouteSealQuery {
     pub correlation_id: String,
     #[serde(default = "default_seal_timeout_ms")]
@@ -390,6 +400,46 @@ pub struct RouteEventsPage {
     pub cursor_gap: bool,
     /// True when the bounded scan stopped before reaching the snapshot's latest sequence.
     pub scan_truncated: bool,
+}
+
+/// A page bounded by the immutable watermark in an existing durable seal.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteReceiptPage {
+    pub producer_schema_generation: u8,
+    pub state: &'static str,
+    #[serde(flatten)]
+    pub page: RouteEventsPage,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteReceiptErrorCode {
+    ReceiptMissing,
+    ReceiptUnsealed,
+}
+
+/// Stable marker for a handled receipt lookup, distinct from an unknown route.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteReceiptErrorResponse {
+    pub schema_version: u8,
+    pub producer_schema_generation: u8,
+    pub correlation_id: String,
+    pub error: RouteReceiptErrorCode,
+}
+
+#[derive(Debug)]
+pub enum RouteReceiptReadError {
+    NotFound,
+    Incomplete,
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for RouteReceiptReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1259,6 +1309,87 @@ impl RouteEventStore {
         let event_count = read_seal_state(&self.seal_path(correlation_id), correlation_id)?
             .map_or(0, |state| state.event_count);
         let high_watermark = through.map_or(latest_sequence, |value| value.min(latest_sequence));
+        Ok(self.scan_page(
+            correlation_id,
+            after,
+            limit,
+            latest_sequence,
+            high_watermark,
+            event_count,
+        ))
+    }
+
+    /// Reads an existing complete seal without admitting calls or changing durable files.
+    pub fn read_sealed_receipt(
+        &self,
+        correlation_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<RouteReceiptPage, RouteReceiptReadError> {
+        validate_correlation_id(correlation_id).map_err(|_| {
+            RouteReceiptReadError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid correlation id",
+            ))
+        })?;
+        let seal_path = self.seal_path(correlation_id);
+        if read_seal_state(&seal_path, correlation_id)?.is_none() {
+            return Err(RouteReceiptReadError::NotFound);
+        }
+        let _local = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("route event writer lock poisoned"))?;
+        check_existing_owned_directory(&self.settings_dir, false)?;
+        check_existing_owned_directory(&self.events_dir(), true)?;
+        let _process_lock = acquire_read_file_lock(&self.lock_path())?;
+        let durable =
+            read_seal_state(&seal_path, correlation_id)?.ok_or(RouteReceiptReadError::NotFound)?;
+        let Some(high_watermark) = durable.high_watermark else {
+            return Err(RouteReceiptReadError::Incomplete);
+        };
+        if !durable.ingress_closed
+            || !durable.active_call_ids.is_empty()
+            || durable.pending_hops != 0
+            || durable.reserved_hops != 0
+        {
+            return Err(RouteReceiptReadError::Incomplete);
+        }
+        // An empty sealed correlation can precede the first event and has no pointer file.
+        // Once a watermark exists above zero, a missing pointer is inconsistent.
+        if high_watermark != 0 {
+            fs::symlink_metadata(self.sequence_path())?;
+        }
+        let latest_sequence = read_last_sequence(&self.sequence_path())?;
+        if latest_sequence < high_watermark {
+            return Err(RouteReceiptReadError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sealed route watermark exceeds the persisted global sequence",
+            )));
+        }
+        Ok(RouteReceiptPage {
+            producer_schema_generation: 1,
+            state: "sealed",
+            page: self.scan_page(
+                correlation_id,
+                after,
+                limit,
+                latest_sequence,
+                high_watermark,
+                durable.event_count,
+            ),
+        })
+    }
+
+    fn scan_page(
+        &self,
+        correlation_id: &str,
+        after: u64,
+        limit: usize,
+        latest_sequence: u64,
+        high_watermark: u64,
+        event_count: u64,
+    ) -> RouteEventsPage {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
         let scan_end = high_watermark.min(after.saturating_add(MAX_SCAN_SEQUENCES));
         let mut events = Vec::with_capacity(limit);
@@ -1286,7 +1417,7 @@ impl RouteEventStore {
         }
         let scan_truncated = next_after < high_watermark
             && high_watermark.saturating_sub(after) > MAX_SCAN_SEQUENCES;
-        Ok(RouteEventsPage {
+        RouteEventsPage {
             schema_version: 1,
             correlation_id: correlation_id.to_string(),
             events,
@@ -1298,7 +1429,7 @@ impl RouteEventStore {
             has_more: next_after < high_watermark,
             cursor_gap,
             scan_truncated,
-        })
+        }
     }
 }
 
@@ -1764,6 +1895,31 @@ fn ensure_private_events_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn check_existing_owned_directory(path: &Path, private: bool) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || (private && metadata.permissions().mode() & 0o077 != 0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed route receipt directory is not private and owned",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed route receipt path is not a directory",
+        ));
+    }
+    Ok(())
+}
+
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
@@ -1806,6 +1962,40 @@ fn acquire_file_lock(path: &Path) -> std::io::Result<FileLock> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(FileLock(file))
+}
+
+#[cfg(unix)]
+fn acquire_read_file_lock(path: &Path) -> std::io::Result<FileLock> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed route lock is not a private owned regular file",
+        ));
+    }
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileLock(file))
+}
+
+#[cfg(not(unix))]
+fn acquire_read_file_lock(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "managed route receipts require Unix domain sockets",
+    ))
 }
 
 #[cfg(not(unix))]
@@ -1867,6 +2057,190 @@ impl RouteEvent {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn durable_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>, u32, std::time::SystemTime)> {
+        use std::os::unix::fs::PermissionsExt;
+        fn visit(
+            root: &Path,
+            path: &Path,
+            entries: &mut Vec<(PathBuf, Vec<u8>, u32, std::time::SystemTime)>,
+        ) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                let bytes = if metadata.is_file() {
+                    fs::read(entry.path()).unwrap()
+                } else {
+                    Vec::new()
+                };
+                entries.push((
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    bytes,
+                    metadata.permissions().mode(),
+                    metadata.modified().unwrap(),
+                ));
+                if metadata.is_dir() {
+                    visit(root, &entry.path(), entries);
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_unknown_is_not_found_without_creating_state() {
+        let dir = tempdir().unwrap();
+        let settings = dir.path().join("settings");
+        let store = RouteEventStore::new(&settings);
+        assert!(matches!(
+            store.read_sealed_receipt("missing", 0, 10),
+            Err(RouteReceiptReadError::NotFound)
+        ));
+        assert!(!settings.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_unsealed_is_conflict_and_does_not_close_ingress() {
+        let dir = tempdir().unwrap();
+        let store = RouteEventStore::new(dir.path());
+        let first = store.register_call("attempt-open").unwrap();
+        assert!(matches!(
+            store.read_sealed_receipt("attempt-open", 0, 10),
+            Err(RouteReceiptReadError::Incomplete)
+        ));
+        let second = store.register_call("attempt-open").unwrap();
+        drop(second);
+        drop(first);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receipt_pages_use_durable_manifest_and_never_change_files() {
+        let dir = tempdir().unwrap();
+        let store = RouteEventStore::new(dir.path());
+        let first = RouteEvent::started("attempt-sealed", "call", 1, "hop", "p", "m");
+        store.append(first.clone()).unwrap();
+        store
+            .append(RouteEvent::started("unrelated", "call", 1, "hop", "p", "m"))
+            .unwrap();
+        store
+            .append(RouteEvent::finished_from(
+                &first,
+                Some("m".into()),
+                Some(200),
+                "complete",
+            ))
+            .unwrap();
+        let seal = store
+            .seal("attempt-sealed", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(seal.sealed);
+        let watermark = seal.high_watermark.unwrap();
+        store
+            .append(RouteEvent::started("later", "call", 1, "hop", "p", "m"))
+            .unwrap();
+        let restarted = RouteEventStore::new(dir.path());
+        let before = durable_snapshot(dir.path());
+        let first_page = restarted
+            .read_sealed_receipt("attempt-sealed", 0, 1)
+            .unwrap();
+        assert_eq!(first_page.state, "sealed");
+        assert_eq!(first_page.producer_schema_generation, 1);
+        assert_eq!(first_page.page.event_count, 2);
+        assert_eq!(first_page.page.high_watermark, watermark);
+        assert_eq!(first_page.page.latest_sequence, 4);
+        assert!(first_page.page.has_more);
+        let second_page = restarted
+            .read_sealed_receipt("attempt-sealed", first_page.page.next_after, 1)
+            .unwrap();
+        assert_eq!(second_page.page.event_count, 2);
+        assert_eq!(second_page.page.high_watermark, watermark);
+        assert_eq!(
+            second_page.page.events[0].event_type,
+            RouteEventType::HopFinished
+        );
+        assert!(!second_page.page.has_more);
+        assert_eq!(durable_snapshot(dir.path()), before);
+        let wire = serde_json::to_value(&second_page).unwrap();
+        assert_eq!(wire["schemaVersion"], 1);
+        assert_eq!(wire["producerSchemaGeneration"], 1);
+        assert_eq!(wire["state"], "sealed");
+        assert!(wire.get("timedOut").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receipt_reports_event_gap_and_bounded_scan_without_repair() {
+        let dir = tempdir().unwrap();
+        let store = RouteEventStore::new(dir.path());
+        let first = RouteEvent::started("attempt-gap", "call", 1, "hop", "p", "m");
+        store.append(first.clone()).unwrap();
+        store
+            .append(RouteEvent::finished_from(
+                &first,
+                Some("m".into()),
+                Some(200),
+                "complete",
+            ))
+            .unwrap();
+        let seal = store
+            .seal("attempt-gap", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(seal.sealed);
+        fs::remove_file(store.event_path(1)).unwrap();
+        let before = durable_snapshot(dir.path());
+        let page = store.read_sealed_receipt("attempt-gap", 0, 10).unwrap();
+        assert!(page.page.cursor_gap);
+        assert_eq!(page.page.event_count, 2);
+        assert_eq!(page.page.high_watermark, 2);
+        assert_eq!(durable_snapshot(dir.path()), before);
+
+        let mut durable = read_seal_state(&store.seal_path("attempt-gap"), "attempt-gap")
+            .unwrap()
+            .unwrap();
+        durable.high_watermark = Some(MAX_SCAN_SEQUENCES + 2);
+        write_seal_state(&store.seal_path("attempt-gap"), &durable).unwrap();
+        write_sequence_atomically(&store.sequence_path(), MAX_SCAN_SEQUENCES + 2).unwrap();
+        let before = durable_snapshot(dir.path());
+        let bounded = store.read_sealed_receipt("attempt-gap", 0, 10).unwrap();
+        assert_eq!(bounded.page.next_after, MAX_SCAN_SEQUENCES);
+        assert!(bounded.page.scan_truncated);
+        assert!(bounded.page.has_more);
+        assert!(bounded.page.cursor_gap);
+        assert_eq!(durable_snapshot(dir.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receipt_fails_closed_when_existing_lock_is_missing() {
+        let dir = tempdir().unwrap();
+        let store = RouteEventStore::new(dir.path());
+        let lease = store.register_call("attempt-lock").unwrap();
+        drop(lease);
+        assert!(
+            store
+                .seal("attempt-lock", std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+                .sealed
+        );
+        fs::remove_file(store.lock_path()).unwrap();
+        let before = durable_snapshot(dir.path());
+        assert!(matches!(
+            store.read_sealed_receipt("attempt-lock", 0, 10),
+            Err(RouteReceiptReadError::Io(_))
+        ));
+        assert_eq!(durable_snapshot(dir.path()), before);
+        assert!(!store.lock_path().exists());
+    }
 
     #[test]
     fn correlation_id_is_bounded_and_header_safe() {
