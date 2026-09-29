@@ -997,7 +997,7 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(40)
-            .min(900);
+            .min(1_500);
         tokio::time::sleep(std::time::Duration::from_secs(hold_secs)).await;
         proxy.stop().await.unwrap();
         if let Some(previous) = previous_test_home {
